@@ -1,229 +1,143 @@
 # opencode-claude-proxy
 
-A local [OpenCode](https://opencode.ai) provider that routes Anthropic model
-calls through the `claude` CLI binary instead of the Anthropic HTTP API. Your
-Claude subscription (Pro / Max) pays for the tokens — no separate API credit
-spend, no separate key.
-
-It's a drop-in AI SDK v3 `LanguageModelV3` implementation. OpenCode loads it
-like any other provider; the only difference is that under the hood it spawns
-`claude --output-format stream-json --input-format stream-json`, pipes the
-current turn in, and translates the CLI's Anthropic-style output stream back
-into OpenCode's expected stream parts.
-
-## Why
-
-`opencode-claude-code-plugin` crashed on `undefined is not an object (evaluating 'usage.inputTokens.total')` because it declared `specificationVersion = "v2"` and returned flat usage numbers, while OpenCode now consumes AI SDK v3's nested `LanguageModelV3Usage` shape (`{ inputTokens: { total, noCache, cacheRead, cacheWrite }, outputTokens: { total, text, reasoning } }`). It also forwarded empty-text content blocks to the CLI, which tripped Anthropic's `cache_control cannot be set for empty text blocks` rejection as soon as the CLI tried to apply a cache breakpoint to them.
-
-This rewrite fixes both at the source:
-
-| Issue                                                   | Fix                                                                                                                                                       |
-| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `usage.inputTokens.total` crash                         | Implements `specificationVersion = "v3"` and always emits nested `LanguageModelV3Usage`. Defensive normalizer never crashes on missing/partial usage.     |
-| `cache_control cannot be set for empty text blocks`     | Filters empty / whitespace-only text parts before serializing the turn to stream-json. Empty turns get a single-space placeholder so the cache breakpoint lands on something valid. |
-| Stale session state after errors                        | Per `(cwd, modelId)` subprocess + session-id tracking. Process is killed and session id cleared on non-zero exit so the next turn spawns clean.          |
-| Tool display                                            | Claude CLI executes `Read` / `Write` / `Edit` / `Bash` / `Glob` / `Grep` / `TodoWrite` internally; we stream them back as `providerExecuted: true` so OpenCode shows them without re-running. MCP tools are passed through for client-side execution. |
-
-## Requirements
-
-Everything the plugin needs at runtime. The installer checks every item below
-and bails out with a clear message if something's missing.
-
-| Tool                                                                           | Why                                                                 | Install                                                                                                              |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| [**Claude CLI**](https://docs.claude.com/en/docs/claude-code/overview)         | This plugin spawns `claude` as a subprocess per model turn.         | Download from the Claude Code docs, then run `claude login` to authenticate against your Claude Pro/Max subscription. |
-| **Claude subscription** (Pro or Max) **or** an `ANTHROPIC_API_KEY`             | The CLI uses whichever credential it can find; we don't touch auth. | Subscription: [claude.ai/upgrade](https://claude.ai/upgrade). API key: [console.anthropic.com](https://console.anthropic.com/settings/keys). |
-| [**OpenCode**](https://opencode.ai)                                            | This is a provider for OpenCode — no point in installing it alone.  | Follow the install instructions at [opencode.ai](https://opencode.ai).                                               |
-| [**Bun**](https://bun.sh) ≥ 1.0                                                | OpenCode runs on Bun; Bun also imports the plugin's `.ts` directly so there's no build step. | `curl -fsSL https://bun.sh/install \| bash`                                                                         |
-| **git**                                                                        | Used by the installer to clone / update the plugin.                 | Included with Xcode Command Line Tools on macOS, `apt install git` / `brew install git` elsewhere.                   |
-
-That's it. The plugin itself has **zero runtime dependencies** — just stdlib
-`child_process`, `readline`, and `events`. No `npm install`, no build, no
-compile step.
-
-## Install
-
-### One-command install (recommended)
+One-command fix so [OpenCode](https://opencode.ai) bills Anthropic calls against your Claude Pro/Max subscription instead of the misleading `"You're out of extra usage"` error.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/fix-opencode.sh | bash
 ```
 
-That's it — this will:
+Re-runnable, idempotent, backs up `~/.config/opencode/opencode.json` before touching it. Works with the OAuth session your `claude login` already set up — no `setup-token`, no API key, no new auth flow.
 
-1. Check every requirement above and fail loudly if something's missing.
-2. Clone (or update) the plugin into `~/.local/share/opencode-claude-proxy`.
-3. Sanity-load it once to confirm OpenCode will accept it.
-4. Back up `~/.config/opencode/opencode.json` (if present) and merge the
-   `claude-proxy` provider entry into it. Existing providers, keys, agents,
-   and settings are preserved.
-5. Print the path and the next step.
-
-Re-run the same command any time to update to the latest `main`.
-
-Optional environment overrides:
-
-| Variable                                    | Default                                          | Purpose                                                                 |
-| ------------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------- |
-| `OPENCODE_CLAUDE_PROXY_DIR`                 | `~/.local/share/opencode-claude-proxy`           | Where to clone the plugin.                                              |
-| `OPENCODE_CONFIG`                           | `~/.config/opencode/opencode.json`               | Which OpenCode config to patch.                                         |
-| `OPENCODE_CLAUDE_PROXY_REF`                 | `main`                                           | Branch, tag, or commit to install.                                      |
-| `OPENCODE_CLAUDE_PROXY_SET_DEFAULT_MODEL=1` | unset                                            | Also set `"model": "claude-proxy/sonnet"` if no default model is set.   |
-
-Example:
+After it runs, restart OpenCode and you're done:
 
 ```bash
-OPENCODE_CLAUDE_PROXY_SET_DEFAULT_MODEL=1 \
-  curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/install.sh | bash
+pkill -x opencode 2>/dev/null
+opencode
 ```
 
-### Manual install
+## The root cause — what's actually broken
 
-If you'd rather inspect things first or skip the installer's config merge:
+Writing this down because I wasted hours on the wrong theory and every plugin and blog post on the internet gets it wrong.
 
-```bash
-git clone https://github.com/iamtheavoc1/opencode-claude-proxy.git ~/opencode-claude-proxy
-```
-
-Then add the provider to your `opencode.json` (or a project-local
-`opencode.json` / `.opencode.json`):
+**Anthropic's `/v1/messages` API validates the `system[]` array for OAuth requests.** For requests billed against the Claude Code subscription pool, `system[]` is allowed to contain exactly one thing: the identity block (`"You are a Claude agent, built on Anthropic's Claude Agent SDK."`). Any additional entries — OpenCode's agent prompts, OhMyOpenCode's Sisyphus configuration, tool descriptions, workspace memory blocks, cache control markers — trigger an HTTP 400 whose error body is:
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "claude-proxy": {
-      "npm": "file:///absolute/path/to/opencode-claude-proxy/src/index.ts",
-      "name": "Claude Proxy",
-      "models": {
-        "sonnet": {
-          "name": "Claude Sonnet 4.6",
-          "limit": { "context": 200000, "output": 16384 }
-        },
-        "opus": {
-          "name": "Claude Opus 4.6",
-          "limit": { "context": 200000, "output": 16384 }
-        },
-        "haiku": {
-          "name": "Claude Haiku 4.5",
-          "limit": { "context": 200000, "output": 8192 }
-        }
-      }
-    }
-  },
-  "model": "claude-proxy/sonnet"
-}
-```
-
-Replace `file:///absolute/path/to/opencode-claude-proxy/src/index.ts` with
-the real absolute path (e.g. `file:///Users/you/opencode-claude-proxy/src/index.ts`).
-OpenCode's provider loader explicitly supports `file://` URLs — see
-`packages/opencode/src/provider/provider.ts` in the opencode source.
-
-You only need to list the model tiers you actually plan to use. The CLI
-accepts the aliases `sonnet`, `opus`, and `haiku` directly, so that's what
-this plugin uses as model IDs.
-
-Restart OpenCode. `claude-proxy/sonnet` (etc.) should now appear in the model
-picker.
-
-### Optional settings
-
-You can pass options through the provider entry's `options` field:
-
-```json
-{
-  "provider": {
-    "claude-proxy": {
-      "npm": "file:///...",
-      "options": {
-        "cliPath": "/custom/path/to/claude",
-        "skipPermissions": true
-      },
-      "models": { "...": {} }
-    }
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "You're out of extra usage. Add more at claude.ai/settings/usage and keep going."
   }
 }
 ```
 
-| Option            | Type      | Default                                          | Description                                                                                   |
-| ----------------- | --------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------- |
-| `cliPath`         | `string`  | `$CLAUDE_CLI_PATH` or `"claude"` (on `$PATH`)    | Absolute path to the `claude` binary.                                                         |
-| `cwd`             | `string`  | `process.cwd()`                                  | Working directory for the subprocess. Tool calls (`Read`, `Bash`, …) run relative to this.    |
-| `skipPermissions` | `boolean` | `true`                                           | Pass `--dangerously-skip-permissions` so the CLI doesn't prompt. Set to `false` to re-enable. |
+**That error message is completely misleading.** The "extra usage" pool isn't the problem. Your subscription pool has plenty of headroom. What Anthropic is actually saying is "your `system[]` is not an attributable Claude Code session", and the fact that it surfaces as an extra-usage error is a billing-classification quirk.
 
-`$CLAUDE_CLI_PATH` (env var) overrides the default lookup if no `cliPath` is set in config.
+What's *not* the problem (despite every other plugin patching these):
 
-## Debug logging
+- `x-anthropic-billing-header` values (`cc_version=X.Y.Z.hash; cc_entrypoint=cli; cch=hash`) — Anthropic computes `cch` as a per-request hash of your prompt, but any value works here as long as the header is present.
+- The user-agent string (`claude-cli/2.1.100 (external, cli)`)
+- The `anthropic-beta` flag list
+- The x-stainless-* SDK headers
+- The OAuth scopes
+- Using `CLAUDE_CODE_OAUTH_TOKEN` vs keychain session tokens
 
-Set `DEBUG=claude-proxy` to get verbose stderr logs showing spawn arguments,
-stream parts, and usage diagnostics:
+What *is* the problem: `system[]` must have exactly the identity block and nothing else. Everything else belongs in the user message.
+
+## How the fix works
+
+`fix-opencode.sh` installs [`@ex-machina/opencode-anthropic-auth`](https://www.npmjs.com/package/@ex-machina/opencode-anthropic-auth), which has a `rewriteRequestBody()` function that transparently relocates every non-identity system block to `messages[0].content` before forwarding to Anthropic:
+
+```js
+// From the plugin's transform.js — this is the entire fix
+// Anthropic's API validates system[] content for OAuth requests.
+// Third-party system prompts trigger a 400 rejection when they
+// appear in system[]. Keep only the identity block in system[]
+// and prepend everything else to the first user message.
+```
+
+So OpenCode keeps building its multi-block system prompts the normal way, the plugin rewrites the body on the fetch boundary, and Anthropic sees a valid shape. Your OpenCode agents and OMO orchestrators work unchanged.
+
+## What the installer does
+
+1. Verifies `claude` CLI, `npm`, `git`, `python3`, and (optionally) `opencode` are reachable. Falls back to common install locations (`~/.bun/bin`, `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`) so it works even when run via `curl | bash` in a subshell that doesn't inherit your interactive PATH.
+2. Downloads `@ex-machina/opencode-anthropic-auth` via `npm pack` (no global install, no root, no side effects on your npm prefix).
+3. Extracts it to `~/.local/share/opencode-anthropic-auth/`.
+4. Backs up `~/.config/opencode/opencode.json` to `opencode.json.bak.<timestamp>`.
+5. Rewrites the config to:
+   - register the plugin via `file://` reference
+   - strip `opencode-claude-bridge` and `opencode-claude-code-plugin` from the `plugin` list (both cause the extra-usage error)
+   - strip `claude-proxy` and `claude-code` provider entries (both superseded)
+   - set the default model to `anthropic/claude-sonnet-4-6` if none is set, or if the existing default pointed at one of the removed providers
+
+Existing keys, other plugins, and other providers are preserved. The rewrite is JSON-safe (done in Python, not sed).
+
+## Requirements
+
+| Tool | Why | Install |
+| --- | --- | --- |
+| [**Claude CLI**](https://docs.claude.com/en/docs/claude-code/overview) | Provides the OAuth session the plugin reuses. | Follow the docs, then `claude login`. |
+| **Claude Pro or Max subscription** | Without one there's nothing to bill against. | [claude.ai/upgrade](https://claude.ai/upgrade) |
+| [**OpenCode**](https://opencode.ai) | The thing we're patching. | Follow the install instructions at opencode.ai. |
+| **npm** | Downloads the plugin from the npm registry. Ships with Node.js. | [nodejs.org](https://nodejs.org/) |
+| **python3** | Rewrites `opencode.json` safely. | Preinstalled on macOS and most Linux distros. |
+| **git** | Used by the installer's sanity checks. | Xcode Command Line Tools / your package manager. |
+
+## Verification
+
+Verified end-to-end on a real machine — **not** an isolated probe — by running the exact path that was consistently failing:
 
 ```bash
-DEBUG=claude-proxy opencode
+opencode run "say exactly: FIXED_FOR_REAL" --model anthropic/claude-sonnet-4-6
 ```
 
-## How it works
-
-1. On each turn, OpenCode calls `doStream(options)` with a v3
-   `LanguageModelV3CallOptions`.
-2. The plugin extracts the system message (if any) and spawns
-   `claude --model <tier> --output-format stream-json --input-format stream-json
-   --verbose --system-prompt <...>` once per `(cwd, modelId)`. Subsequent turns
-   reuse the same process so the CLI keeps its in-memory session state.
-3. The current user turn is serialized to Anthropic stream-json format and
-   written to the subprocess's stdin. Empty text blocks are filtered — see
-   `src/message-builder.ts` for the full rules.
-4. stdout lines are parsed as the CLI's stream-json output
-   (`content_block_start/delta/stop`, `assistant`, `user`, `result`, …) and
-   translated to AI SDK v3 `LanguageModelV3StreamPart`s
-   (`text-start`/`text-delta`/`tool-call`/`tool-result`/…).
-5. Usage is normalized to the v3 nested shape in `src/usage.ts`. Anthropic's
-   flat `input_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`
-   become `inputTokens: { total, noCache, cacheRead, cacheWrite }` with
-   `total = noCache + cacheRead + cacheWrite` — matching how OpenCode's session
-   layer (`session/index.ts`) computes cost.
-
-## Project layout
-
-```
-src/
-├── index.ts                       # createClaudeProxy() factory (the `create*` export OpenCode looks for)
-├── claude-proxy-language-model.ts # LanguageModelV3 implementation — doStream / doGenerate
-├── usage.ts                       # toV3Usage() — defensive nested usage normalization
-├── message-builder.ts             # prompt → Anthropic stream-json, with empty-block filter
-├── tool-mapping.ts                # CLI tool names → OpenCode tool names + providerExecuted flags
-├── session-manager.ts             # per-(cwd,modelId) subprocess + session-id tracking
-└── logger.ts                      # DEBUG=claude-proxy logger
-```
+through OhMyOpenCode's **Sisyphus (Ultraworker)** agent orchestrator (which attaches a large multi-block system prompt), the model returned `FIXED_FOR_REAL`, the bridge debug log showed **two HTTP 200 responses** from Anthropic, and the TUI had zero errors. Before the fix, the same command produced `"You're out of extra usage"` on the first turn every single time.
 
 ## Troubleshooting
 
-**"claude-proxy: failed to spawn 'claude'"**
-`claude` isn't on `$PATH`. Either fix your PATH or set `cliPath` in the
-provider config to the absolute binary path.
+**Still seeing `"out of extra usage"` after running the installer.**
+OpenCode caches plugins in memory — the running TUI didn't reload. Kill it and relaunch:
 
-**Stream hangs / no response**
-Run with `DEBUG=claude-proxy` to see the raw CLI stream. If you see the CLI
-exit immediately, try `claude --print "hi"` in a terminal to check it's
-authenticated.
+```bash
+pkill -x opencode 2>/dev/null
+opencode
+```
 
-**"Session ID already in use"**
-The previous turn's process died mid-stream. The plugin clears the stored
-session id on non-zero exit codes and respawns fresh on the next turn — just
-send another message.
+**Getting 401 / `authentication_error` instead.**
+Your OpenCode OAuth token went stale. The plugin auto-refreshes on every call but if the refresh token itself expired (happens after long periods of inactivity or if you revoked the grant), you need to clear and re-auth:
 
-**Usage shows zeros**
-If the CLI doesn't emit a `result` message (e.g. aborted turns), usage falls
-back to `undefined`. Nothing crashes; OpenCode just reports zero tokens for
-that turn.
+```bash
+# Option 1: clear the OpenCode auth entry and let the plugin re-bootstrap on next call
+python3 -c '
+import json, os
+p = os.path.expanduser("~/.local/share/opencode/auth.json")
+a = json.load(open(p))
+a.pop("anthropic", None)
+json.dump(a, open(p, "w"), indent=2)
+'
+# then re-run the installer OR opencode auth → Claude Pro/Max
+```
+
+**Running the installer overwrote my default model.**
+It only replaces the default if it was unset or pointed at a removed provider (`claude-code/*` or `claude-proxy/*`). Your backup is at `~/.config/opencode/opencode.json.bak.<timestamp>` — copy the `"model"` field back if you need to.
+
+**The plugin got an npm update, how do I reapply?**
+Re-run the same curl command. It's idempotent and picks up the latest version on each run.
+
+## Token lifecycle
+
+The plugin reuses the OAuth token OpenCode already has at `~/.local/share/opencode/auth.json`. On every `/v1/messages` call it:
+
+1. Checks the `expires` timestamp.
+2. If within ~1 minute of expiry, POSTs to `https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token` and swaps in a fresh access+refresh pair atomically.
+3. Retries twice on network errors (500ms, then 1s backoff).
+4. Writes the rotated tokens back to `auth.json`.
+
+Under normal use the refresh cycle runs forever and you never notice. Revoking the OAuth grant on claude.ai, ending your subscription, or not using the plugin for long enough to let the refresh token itself expire are the failure modes.
 
 ## Credits
 
-Tool mapping and stream-parsing logic is adapted from the original
-`opencode-claude-code-plugin`. This rewrite targets AI SDK v3, fixes the
-`usage.inputTokens.total` and `cache_control` crashes, and is distributed as a
-local file:// provider rather than an npm package.
+The actual fix — the `rewriteRequestBody` logic that relocates non-identity system blocks — is in [`@ex-machina/opencode-anthropic-auth`](https://www.npmjs.com/package/@ex-machina/opencode-anthropic-auth) by [ex-machina-co](https://github.com/ex-machina-co/opencode-anthropic-auth). Huge thanks to [@juliancoy](https://github.com/juliancoy) for figuring out the `system[]` validation and publishing the plugin. This repo is just a one-command installer that wires it into OpenCode's config correctly and rips out the broken legacy plugins.
 
 ## License
 
