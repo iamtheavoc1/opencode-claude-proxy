@@ -33,23 +33,57 @@ note()  { printf '      %s\n'    "$(c_dim "$1")"; }
 # ─── Requirements ────────────────────────────────────────────────────────────
 step "Checking requirements"
 
-command -v git >/dev/null 2>&1 || fail "git not found — install from https://git-scm.com/downloads"
-ok "git — $(git --version | awk '{print $3}')"
+# Resolve a tool by looking it up on PATH, then falling back to common install
+# locations (Bun installs to ~/.bun/bin by default, Claude CLI to ~/.local/bin,
+# Homebrew to /opt/homebrew/bin or /usr/local/bin, etc.). Sets a global named
+# "<TOOL>_BIN" on success.
+resolve_tool() {
+  local tool="$1"
+  shift
+  local found
+  found=$(command -v "$tool" 2>/dev/null || true)
+  if [ -n "$found" ] && [ -x "$found" ]; then
+    printf '%s' "$found"
+    return 0
+  fi
+  for candidate in "$@"; do
+    if [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
-if ! command -v claude >/dev/null 2>&1; then
-  fail "claude CLI not found — install from https://docs.claude.com/en/docs/claude-code/overview then run: claude login"
-fi
-CLAUDE_VER=$(claude --version 2>/dev/null || echo "unknown")
+GIT_BIN=$(resolve_tool git /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git) \
+  || fail "git not found — install from https://git-scm.com/downloads"
+ok "git — $("$GIT_BIN" --version | awk '{print $3}')"
+
+CLAUDE_BIN=$(resolve_tool claude \
+    "$HOME/.local/bin/claude" \
+    "$HOME/.claude/local/claude" \
+    /opt/homebrew/bin/claude \
+    /usr/local/bin/claude) \
+  || fail "claude CLI not found — install from https://docs.claude.com/en/docs/claude-code/overview then run: claude login"
+CLAUDE_VER=$("$CLAUDE_BIN" --version 2>/dev/null || echo "unknown")
 ok "claude CLI — $CLAUDE_VER"
+note "binary: $CLAUDE_BIN"
 
-if ! command -v bun >/dev/null 2>&1; then
-  fail "bun not found — OpenCode runs under bun. Install: curl -fsSL https://bun.sh/install | bash"
-fi
-ok "bun — $(bun --version)"
+BUN_BIN=$(resolve_tool bun \
+    "$HOME/.bun/bin/bun" \
+    /opt/homebrew/bin/bun \
+    /usr/local/bin/bun) \
+  || fail "bun not found — OpenCode runs under bun. Install: curl -fsSL https://bun.sh/install | bash"
+ok "bun — $("$BUN_BIN" --version)"
+note "binary: $BUN_BIN"
 
-# Non-fatal: warn if CLI doesn't look authenticated
-if ! claude auth status >/dev/null 2>&1 && ! claude --help >/dev/null 2>&1; then
-  warn "could not verify claude auth — run 'claude login' if you hit auth errors later"
+# Make the resolved paths available to any later `command -v` lookups and to
+# subshells the installer spawns.
+export PATH="$(dirname "$BUN_BIN"):$(dirname "$CLAUDE_BIN"):$(dirname "$GIT_BIN"):$PATH"
+
+# Non-fatal: warn if CLI doesn't even respond to --help
+if ! "$CLAUDE_BIN" --help >/dev/null 2>&1; then
+  warn "claude CLI did not respond to --help — run 'claude login' if you hit auth errors later"
 fi
 
 # ─── Clone / update ──────────────────────────────────────────────────────────
@@ -57,13 +91,13 @@ step "Installing plugin to $INSTALL_DIR"
 
 if [ -d "$INSTALL_DIR/.git" ]; then
   ok "existing install detected — updating"
-  git -C "$INSTALL_DIR" fetch --quiet --depth 1 origin "$REF"
-  git -C "$INSTALL_DIR" reset --quiet --hard FETCH_HEAD
+  "$GIT_BIN" -C "$INSTALL_DIR" fetch --quiet --depth 1 origin "$REF"
+  "$GIT_BIN" -C "$INSTALL_DIR" reset --quiet --hard FETCH_HEAD
 elif [ -e "$INSTALL_DIR" ]; then
   fail "$INSTALL_DIR exists but isn't a git checkout — move or delete it and re-run"
 else
   mkdir -p "$(dirname "$INSTALL_DIR")"
-  git clone --quiet --depth 1 --branch "$REF" "$REPO_URL" "$INSTALL_DIR"
+  "$GIT_BIN" clone --quiet --depth 1 --branch "$REF" "$REPO_URL" "$INSTALL_DIR"
   ok "cloned $REPO_URL"
 fi
 
@@ -77,7 +111,7 @@ ok "entry: $ENTRY_URL"
 # ─── Sanity-load the plugin ──────────────────────────────────────────────────
 step "Verifying plugin loads"
 
-bun -e "
+"$BUN_BIN" -e "
 import create from '$ENTRY_PATH';
 const p = create();
 const m = p.languageModel('sonnet');
@@ -97,7 +131,7 @@ if [ -f "$CONFIG_PATH" ]; then
   ok "backup: $BACKUP"
 fi
 
-CONFIG_PATH="$CONFIG_PATH" ENTRY_URL="$ENTRY_URL" SET_DEFAULT_MODEL="$SET_DEFAULT_MODEL" bun -e '
+CONFIG_PATH="$CONFIG_PATH" ENTRY_URL="$ENTRY_URL" SET_DEFAULT_MODEL="$SET_DEFAULT_MODEL" "$BUN_BIN" -e '
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 const path = process.env.CONFIG_PATH;
 const entry = process.env.ENTRY_URL;
