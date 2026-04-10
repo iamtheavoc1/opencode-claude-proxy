@@ -1,5 +1,7 @@
 # opencode-claude-proxy
 
+The repository name is historical. The current fix does **not** run a local Claude proxy — it installs Anthropic auth wiring plus a self-healing token recovery patch on top of `@ex-machina/opencode-anthropic-auth`.
+
 One-command fix so [OpenCode](https://opencode.ai) bills Anthropic calls against your Claude Pro/Max subscription instead of the misleading `"You're out of extra usage"` error.
 
 ```bash
@@ -8,11 +10,12 @@ curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/m
 
 Re-runnable, idempotent, backs up `~/.config/opencode/opencode.json` before touching it. Works with the OAuth session your `claude login` already set up — no `setup-token`, no API key, no new auth flow.
 
+You do **not** need to fetch a token manually. Run `claude login` once, run the one-line installer, and OpenCode will reuse that session. It refreshes its own token automatically, and if OpenCode's stored refresh token goes stale while Claude CLI is still logged in, the patched plugin re-syncs from Claude CLI locally.
+
 After it runs, restart OpenCode and you're done:
 
 ```bash
-pkill -x opencode 2>/dev/null
-opencode
+pkill -x opencode 2>/dev/null; opencode
 ```
 
 ## The root cause — what's actually broken
@@ -63,8 +66,11 @@ So OpenCode keeps building its multi-block system prompts the normal way, the pl
 1. Verifies `claude` CLI, `npm`, `git`, `python3`, and (optionally) `opencode` are reachable. Falls back to common install locations (`~/.bun/bin`, `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`) so it works even when run via `curl | bash` in a subshell that doesn't inherit your interactive PATH.
 2. Downloads `@ex-machina/opencode-anthropic-auth` via `npm pack` (no global install, no root, no side effects on your npm prefix).
 3. Extracts it to `~/.local/share/opencode-anthropic-auth/`.
-4. Backs up `~/.config/opencode/opencode.json` to `opencode.json.bak.<timestamp>`.
-5. Rewrites the config to:
+4. Patches the installed plugin so auth is less brittle:
+   - refreshes within 60 seconds of expiry instead of waiting until the token is already dead
+   - if OpenCode's refresh token is stale but your local `claude` CLI is still logged in, locally borrows a fresh Claude CLI bearer token and keeps the request flowing
+5. Backs up `~/.config/opencode/opencode.json` to `opencode.json.bak.<timestamp>`.
+6. Rewrites the config to:
    - register the plugin via `file://` reference
    - strip `opencode-claude-bridge` and `opencode-claude-code-plugin` from the `plugin` list (both cause the extra-usage error)
    - strip `claude-proxy` and `claude-code` provider entries (both superseded)
@@ -99,23 +105,22 @@ through OhMyOpenCode's **Sisyphus (Ultraworker)** agent orchestrator (which atta
 OpenCode caches plugins in memory — the running TUI didn't reload. Kill it and relaunch:
 
 ```bash
-pkill -x opencode 2>/dev/null
-opencode
+pkill -x opencode 2>/dev/null; opencode
 ```
 
-**Getting 401 / `authentication_error` instead.**
-Your OpenCode OAuth token went stale. The plugin auto-refreshes on every call but if the refresh token itself expired (happens after long periods of inactivity or if you revoked the grant), you need to clear and re-auth:
+**Getting `Token refresh failed: 400 — {"error":"invalid_grant", ...}`.**
+That means OpenCode's stored refresh token is stale. The installer-patched plugin now tries to self-heal by borrowing a fresh bearer token from your local `claude` CLI login. If `claude` is still logged in, the next request should recover automatically.
+
+If it still fails, either `claude` itself is logged out or both auth stores are stale. Re-auth once and you're back:
 
 ```bash
-# Option 1: clear the OpenCode auth entry and let the plugin re-bootstrap on next call
-python3 -c '
-import json, os
-p = os.path.expanduser("~/.local/share/opencode/auth.json")
-a = json.load(open(p))
-a.pop("anthropic", None)
-json.dump(a, open(p, "w"), indent=2)
-'
-# then re-run the installer OR opencode auth → Claude Pro/Max
+claude login
+```
+
+If OpenCode keeps holding onto a bad auth record after that, clear just the Anthropic entry and let the plugin rebuild from the next request:
+
+```bash
+python3 -c 'import json,os; p=os.path.expanduser("~/.local/share/opencode/auth.json"); a=json.load(open(p)); a.pop("anthropic", None); json.dump(a, open(p, "w"), indent=2)'
 ```
 
 **Running the installer overwrote my default model.**
@@ -130,10 +135,11 @@ The plugin reuses the OAuth token OpenCode already has at `~/.local/share/openco
 
 1. Checks the `expires` timestamp.
 2. If within ~1 minute of expiry, POSTs to `https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token` and swaps in a fresh access+refresh pair atomically.
-3. Retries twice on network errors (500ms, then 1s backoff).
-4. Writes the rotated tokens back to `auth.json`.
+3. If that refresh fails with `invalid_grant` but your local Claude CLI login is still alive, it spins up a loopback capture, asks `claude` for a local request, grabs the current bearer token, and writes that back into OpenCode's auth cache.
+4. Retries twice on network errors (500ms, then 1s backoff).
+5. Writes the rotated/recovered tokens back to `auth.json`.
 
-Under normal use the refresh cycle runs forever and you never notice. Revoking the OAuth grant on claude.ai, ending your subscription, or not using the plugin for long enough to let the refresh token itself expire are the failure modes.
+Under normal use the refresh cycle runs forever and you never notice. If the OpenCode refresh token dies but `claude login` is still valid, the plugin now recovers automatically. If both are stale, you need to log back into Claude CLI once.
 
 ## Credits
 

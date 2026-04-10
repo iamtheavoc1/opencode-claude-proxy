@@ -10,12 +10,16 @@
 #   2. Downloads @ex-machina/opencode-anthropic-auth from npm (the only plugin
 #      that actually handles Anthropic's OAuth request-shape validation correctly)
 #   3. Installs it to ~/.local/share/opencode-anthropic-auth
-#   4. Updates ~/.config/opencode/opencode.json:
+#   4. Patches the installed plugin so expired OAuth sessions self-heal:
+#      - refreshes within 60s of expiry instead of waiting until fully expired
+#      - if OpenCode's refresh token has gone stale but Claude CLI is still
+#        logged in, borrows a fresh Claude CLI bearer token locally and keeps going
+#   5. Updates ~/.config/opencode/opencode.json:
 #      - removes any previously installed opencode-claude-bridge entry
 #      - removes any previously installed claude-proxy provider entry
 #      - adds the ex-machina plugin via file:// reference
 #      - sets default model to anthropic/claude-sonnet-4-6 if none is set
-#   5. Backs up your opencode.json before modifying
+#   6. Backs up your opencode.json before modifying
 #
 # Why this is needed — the actual root cause:
 #
@@ -84,6 +88,10 @@ OPENCODE_BIN=$(resolve_tool opencode "$HOME/.opencode/bin/opencode" /opt/homebre
   || warn "opencode binary not found on PATH — installer will still work, but you'll need to install OpenCode before it takes effect"
 [ -n "${OPENCODE_BIN:-}" ] && ok "opencode — $("$OPENCODE_BIN" --version 2>/dev/null | head -1)"
 
+PY_BIN=$(resolve_tool python3 /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3) \
+  || fail "python3 not found — required to patch the plugin and safely update opencode.json"
+ok "python3 — $("$PY_BIN" --version 2>/dev/null | awk '{print $2}')"
+
 # ─── Download + install the plugin ───────────────────────────────────────────
 step "Installing $NPM_PKG to $REPO_ENTRY_DIR"
 
@@ -107,6 +115,153 @@ mv "$TMPDIR/package" "$REPO_ENTRY_DIR"
 ok "installed to $REPO_ENTRY_DIR"
 ok "entry: $PLUGIN_REF"
 
+# ─── Patch plugin auth recovery ──────────────────────────────────────────────
+step "Patching plugin auth recovery"
+
+cat > "$REPO_ENTRY_DIR/dist/claude-cli-sync.js" <<'JS'
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+const SYNC_PROMPT = 'say exactly: AUTH_SYNC_OK';
+const SYNC_MODEL = process.env.OPENCODE_ANTHROPIC_AUTH_CLAUDE_SYNC_MODEL || 'claude-sonnet-4-6';
+const SYNC_TIMEOUT_MS = Number(process.env.OPENCODE_ANTHROPIC_AUTH_CLAUDE_SYNC_TIMEOUT_MS || 20000);
+const SYNC_TTL_MS = Number(process.env.OPENCODE_ANTHROPIC_AUTH_CLAUDE_SYNC_TTL_MS || 1800000);
+function resolveClaudeBin() {
+    const candidates = [
+        process.env.CLAUDE_BIN,
+        join(homedir(), '.local/bin/claude'),
+        join(homedir(), '.claude/local/claude'),
+        '/opt/homebrew/bin/claude',
+        '/usr/local/bin/claude',
+        'claude',
+    ].filter(Boolean);
+    for (const candidate of candidates) {
+        if (candidate === 'claude' || existsSync(candidate))
+            return candidate;
+    }
+    return 'claude';
+}
+function captureClaudeCliBearer() {
+    return new Promise((resolve, reject) => {
+        let child = null;
+        let settled = false;
+        let timeout = null;
+        let stderr = '';
+        const finish = (handler, value) => {
+            if (settled)
+                return;
+            settled = true;
+            if (timeout)
+                clearTimeout(timeout);
+            server.close();
+            if (child && child.exitCode === null) {
+                child.kill('SIGTERM');
+            }
+            handler(value);
+        };
+        const server = createServer((req, res) => {
+            if (req.method === 'HEAD') {
+                res.writeHead(200);
+                res.end();
+                return;
+            }
+            if (req.method === 'POST' && req.url?.startsWith('/v1/messages')) {
+                const authorization = req.headers.authorization;
+                res.writeHead(204);
+                res.end();
+                if (typeof authorization === 'string' && authorization.startsWith('Bearer ')) {
+                    finish(resolve, authorization.slice('Bearer '.length));
+                    return;
+                }
+                finish(reject, new Error('Claude CLI token sync captured no bearer token'));
+                return;
+            }
+            res.writeHead(404);
+            res.end();
+        });
+        server.on('error', (error) => finish(reject, error));
+        server.listen(0, '127.0.0.1', () => {
+            const address = server.address();
+            if (!address || typeof address === 'string') {
+                finish(reject, new Error('Claude CLI token sync failed to bind loopback server'));
+                return;
+            }
+            const env = {
+                ...process.env,
+                ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
+            };
+            child = spawn(resolveClaudeBin(), ['--print', SYNC_PROMPT, '--model', SYNC_MODEL], {
+                cwd: homedir(),
+                env,
+                stdio: ['ignore', 'ignore', 'pipe'],
+            });
+            child.stderr.on('data', (chunk) => {
+                stderr += chunk.toString();
+                if (stderr.length > 2000) {
+                    stderr = stderr.slice(-2000);
+                }
+            });
+            child.on('error', (error) => finish(reject, error));
+            child.on('exit', (code) => {
+                if (!settled) {
+                    const suffix = stderr.trim() ? ` — ${stderr.trim()}` : '';
+                    finish(reject, new Error(`Claude CLI exited before token sync completed (${code ?? 'unknown'})${suffix}`));
+                }
+            });
+        });
+        timeout = setTimeout(() => {
+            finish(reject, new Error('Timed out syncing token from Claude CLI'));
+        }, SYNC_TIMEOUT_MS);
+    });
+}
+export async function syncClaudeCliAccessToken() {
+    const access = await captureClaudeCliBearer();
+    return {
+        access,
+        expires: Date.now() + Math.max(60000, SYNC_TTL_MS),
+    };
+}
+JS
+
+REPO_ENTRY_DIR="$REPO_ENTRY_DIR" "$PY_BIN" - <<'PY' || fail "failed to patch plugin auth recovery"
+from pathlib import Path
+import os, sys
+
+index_path = Path(os.environ["REPO_ENTRY_DIR"]) / "dist" / "index.js"
+src = index_path.read_text()
+
+import_line = "import { createStrippedStream, isInsecure, mergeHeaders, rewriteRequestBody, rewriteUrl, setOAuthHeaders, } from './transform';\n"
+if "syncClaudeCliAccessToken" not in src:
+    if import_line not in src:
+        print("    unsupported upstream index.js layout (import line not found)", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(import_line, import_line + "import { syncClaudeCliAccessToken } from './claude-cli-sync';\n", 1)
+
+marker = "                    let refreshPromise = null;\n"
+helper = """                    let refreshPromise = null;\n                    let cliSyncPromise = null;\n                    const syncFromClaudeCli = async () => {\n                        if (!cliSyncPromise) {\n                            cliSyncPromise = (async () => {\n                                const synced = await syncClaudeCliAccessToken();\n                                const existing = await getAuth();\n                                const preservedRefresh = existing.type === 'oauth' ? existing.refresh : undefined;\n                                await client.auth.set({\n                                    path: {\n                                        id: 'anthropic',\n                                    },\n                                    body: {\n                                        type: 'oauth',\n                                        refresh: preservedRefresh,\n                                        access: synced.access,\n                                        expires: synced.expires,\n                                    },\n                                });\n                                return synced.access;\n                            })().finally(() => {\n                                cliSyncPromise = null;\n                            });\n                        }\n                        return await cliSyncPromise;\n                    };\n"""
+if "const syncFromClaudeCli = async () => {" not in src:
+    if marker not in src:
+        print("    unsupported upstream index.js layout (refresh marker not found)", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(marker, helper, 1)
+
+old_if = """                            if (!auth.access || !auth.expires || auth.expires < Date.now()) {\n                                if (!refreshPromise) {\n                                    refreshPromise = (async () => {\n                                        const maxRetries = 2;\n                                        const baseDelayMs = 500;\n                                        for (let attempt = 0; attempt <= maxRetries; attempt++) {\n                                            try {\n                                                if (attempt > 0) {\n                                                    const delay = baseDelayMs * 2 ** (attempt - 1);\n                                                    await new Promise((resolve) => setTimeout(resolve, delay));\n                                                }\n                                                const response = await fetch(TOKEN_URL, {\n                                                    method: 'POST',\n                                                    headers: {\n                                                        'Content-Type': 'application/json',\n                                                        Accept: 'application/json, text/plain, */*',\n                                                        'User-Agent': 'axios/1.13.6',\n                                                    },\n                                                    body: JSON.stringify({\n                                                        grant_type: 'refresh_token',\n                                                        refresh_token: auth.refresh,\n                                                        client_id: CLIENT_ID,\n                                                    }),\n                                                });\n                                                if (!response.ok) {\n                                                    if (response.status >= 500 && attempt < maxRetries) {\n                                                        await response.body?.cancel();\n                                                        continue;\n                                                    }\n                                                    const body = await response.text().catch(() => '');\n                                                    throw new Error(`Token refresh failed: ${response.status} — ${body}`);\n                                                }\n                                                const json = (await response.json());\n                                                // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set\n                                                await client.auth.set({\n                                                    path: {\n                                                        id: 'anthropic',\n                                                    },\n                                                    body: {\n                                                        type: 'oauth',\n                                                        refresh: json.refresh_token,\n                                                        access: json.access_token,\n                                                        expires: Date.now() + json.expires_in * 1000,\n                                                    },\n                                                });\n                                                return json.access_token;\n                                            }\n                                            catch (error) {\n                                                const isNetworkError = error instanceof Error &&\n                                                    (error.message.includes('fetch failed') ||\n                                                        ('code' in error &&\n                                                            (error.code === 'ECONNRESET' ||\n                                                                error.code === 'ECONNREFUSED' ||\n                                                                error.code === 'ETIMEDOUT' ||\n                                                                error.code === 'UND_ERR_CONNECT_TIMEOUT')));\n                                                if (attempt < maxRetries && isNetworkError) {\n                                                    continue;\n                                                }\n                                                throw error;\n                                            }\n                                        }\n                                        // Unreachable — each iteration either returns or throws.\n                                        // Kept as a TypeScript exhaustiveness guard.\n                                        throw new Error('Token refresh exhausted all retries');\n                                    })().finally(() => {\n                                        refreshPromise = null;\n                                    });\n                                }\n                                auth.access = await refreshPromise;\n                            }\n"""
+
+new_if = """                            if (!auth.access || !auth.expires || auth.expires < Date.now() + 60000) {\n                                if (!auth.refresh) {\n                                    auth.access = await syncFromClaudeCli();\n                                }\n                                else {\n                                    if (!refreshPromise) {\n                                        refreshPromise = (async () => {\n                                            const maxRetries = 2;\n                                            const baseDelayMs = 500;\n                                            for (let attempt = 0; attempt <= maxRetries; attempt++) {\n                                                try {\n                                                    if (attempt > 0) {\n                                                        const delay = baseDelayMs * 2 ** (attempt - 1);\n                                                        await new Promise((resolve) => setTimeout(resolve, delay));\n                                                    }\n                                                    const response = await fetch(TOKEN_URL, {\n                                                        method: 'POST',\n                                                        headers: {\n                                                            'Content-Type': 'application/json',\n                                                            Accept: 'application/json, text/plain, */*',\n                                                            'User-Agent': 'axios/1.13.6',\n                                                        },\n                                                        body: JSON.stringify({\n                                                            grant_type: 'refresh_token',\n                                                            refresh_token: auth.refresh,\n                                                            client_id: CLIENT_ID,\n                                                        }),\n                                                    });\n                                                    if (!response.ok) {\n                                                        if (response.status >= 500 && attempt < maxRetries) {\n                                                            await response.body?.cancel();\n                                                            continue;\n                                                        }\n                                                        const body = await response.text().catch(() => '');\n                                                        const isInvalidGrant = response.status == 400 && body.includes('invalid_grant');\n                                                        if (isInvalidGrant) {\n                                                            return await syncFromClaudeCli();\n                                                        }\n                                                        throw new Error(`Token refresh failed: ${response.status} — ${body}`);\n                                                    }\n                                                    const json = (await response.json());\n                                                    // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set\n                                                    await client.auth.set({\n                                                        path: {\n                                                            id: 'anthropic',\n                                                        },\n                                                        body: {\n                                                            type: 'oauth',\n                                                            refresh: json.refresh_token,\n                                                            access: json.access_token,\n                                                            expires: Date.now() + json.expires_in * 1000,\n                                                        },\n                                                    });\n                                                    return json.access_token;\n                                                }\n                                                catch (error) {\n                                                    const isNetworkError = error instanceof Error &&\n                                                        (error.message.includes('fetch failed') ||\n                                                            ('code' in error &&\n                                                                (error.code === 'ECONNRESET' ||\n                                                                    error.code === 'ECONNREFUSED' ||\n                                                                    error.code === 'ETIMEDOUT' ||\n                                                                    error.code === 'UND_ERR_CONNECT_TIMEOUT')));\n                                                    if (attempt < maxRetries && isNetworkError) {\n                                                        continue;\n                                                    }\n                                                    throw error;\n                                                }\n                                            }\n                                            // Unreachable — each iteration either returns or throws.\n                                            // Kept as a TypeScript exhaustiveness guard.\n                                            throw new Error('Token refresh exhausted all retries');\n                                        })().finally(() => {\n                                            refreshPromise = null;\n                                        });\n                                    }\n                                    auth.access = await refreshPromise;\n                                }\n                            }\n"""
+
+if "auth.expires < Date.now() + 60000" not in src or "return await syncFromClaudeCli();" not in src:
+    if old_if not in src:
+        print("    unsupported upstream index.js layout (refresh block not found)", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old_if, new_if, 1)
+
+index_path.write_text(src)
+PY
+
+ok "refreshes 60s before expiry and falls back to Claude CLI on invalid_grant"
+
 # ─── Update opencode.json ────────────────────────────────────────────────────
 step "Updating $CONFIG_PATH"
 
@@ -116,9 +271,6 @@ if [ -f "$CONFIG_PATH" ]; then
   cp "$CONFIG_PATH" "$BAK"
   ok "backup: $BAK"
 fi
-
-PY_BIN=$(resolve_tool python3 /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3) \
-  || fail "python3 not found — required to safely update opencode.json"
 
 CONFIG_PATH="$CONFIG_PATH" PLUGIN_REF="$PLUGIN_REF" "$PY_BIN" - <<'PY' || fail "failed to update $CONFIG_PATH"
 import json, os, sys
