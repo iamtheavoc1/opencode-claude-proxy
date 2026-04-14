@@ -3,7 +3,7 @@
 # Pro/Max subscription instead of hitting "You're out of extra usage".
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/fix-opencode.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth-fix/main/fix-opencode.sh | bash
 #
 # What it does, in order:
 #   1. Verifies requirements (claude CLI, opencode, npm/git)
@@ -257,10 +257,20 @@ if "auth.expires < Date.now() + 60000" not in src or "return await syncFromClaud
         sys.exit(1)
     src = src.replace(old_if, new_if, 1)
 
+old_fetch = """                            const response = await fetch(rewritten.input, {\n                                ...init,\n                                body,\n                                headers: requestHeaders,\n                                ...(isInsecure() && { tls: { rejectUnauthorized: false } }),\n                            });\n                            return createStrippedStream(response);\n"""
+
+new_fetch = """                            const sendRequest = async (headers) => await fetch(rewritten.input, {\n                                ...init,\n                                body,\n                                headers,\n                                ...(isInsecure() && { tls: { rejectUnauthorized: false } }),\n                            });\n                            const isRetryableAuthFailure = async (response) => {\n                                if (response.status === 401 || response.status === 403) {\n                                    return true;\n                                }\n                                if (response.status !== 400) {\n                                    return false;\n                                }\n                                const bodyText = await response.clone().text().catch(() => '');\n                                const lowered = bodyText.toLowerCase();\n                                return lowered.includes('invalid authentication credentials') ||\n                                    (lowered.includes('authentication') && lowered.includes('invalid'));\n                            };\n                            let response = await sendRequest(requestHeaders);\n                            if (await isRetryableAuthFailure(response)) {\n                                auth.access = await syncFromClaudeCli();\n                                const retryHeaders = new Headers(requestHeaders);\n                                setOAuthHeaders(retryHeaders, auth.access);\n                                response = await sendRequest(retryHeaders);\n                            }\n                            return createStrippedStream(response);\n"""
+
+if "const sendRequest = async (headers) => await fetch(rewritten.input, {" not in src:
+    if old_fetch not in src:
+        print("    unsupported upstream index.js layout (request fetch block not found)", file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old_fetch, new_fetch, 1)
+
 index_path.write_text(src)
 PY
 
-ok "refreshes 60s before expiry and falls back to Claude CLI on invalid_grant"
+ok "refreshes early, recovers invalid_grant, and retries invalid live auth via Claude CLI"
 
 # ─── Update opencode.json ────────────────────────────────────────────────────
 step "Updating $CONFIG_PATH"

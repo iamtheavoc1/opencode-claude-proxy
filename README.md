@@ -5,7 +5,7 @@ The repository name is historical. The current fix does **not** run a local Clau
 One-command fix so [OpenCode](https://opencode.ai) bills Anthropic calls against your Claude Pro/Max subscription instead of the misleading `"You're out of extra usage"` error.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-claude-proxy/main/fix-opencode.sh | bash
+curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth-fix/main/fix-opencode.sh | bash
 ```
 
 Re-runnable, idempotent, backs up `~/.config/opencode/opencode.json` before touching it. Works with the OAuth session your `claude login` already set up — no `setup-token`, no API key, no new auth flow.
@@ -110,6 +110,8 @@ pkill -x opencode 2>/dev/null; opencode
 
 **Getting `Token refresh failed: 400 — {"error":"invalid_grant", ...}`.**
 That means OpenCode's stored refresh token is stale. The installer-patched plugin now tries to self-heal by borrowing a fresh bearer token from your local `claude` CLI login. If `claude` is still logged in, the next request should recover automatically.
+
+If you instead see `invalid authentication credentials`, that usually means the cached OpenCode access token is no longer accepted even though its stored expiry timestamp hasn't elapsed yet. The installer-patched plugin now detects that live request failure, re-syncs a fresh bearer token from your local `claude` CLI session, writes it back to OpenCode's auth cache, and retries the request automatically.
 
 If it still fails, either `claude` itself is logged out or both auth stores are stale. Re-auth once and you're back:
 
