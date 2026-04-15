@@ -8,13 +8,16 @@ One-command fix so [OpenCode](https://opencode.ai) bills Anthropic calls against
 curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth-fix/main/fix-opencode.sh | bash
 ```
 
-Re-runnable, idempotent, backs up `~/.config/opencode/opencode.json` before touching it. Works with the OAuth session your `claude login` already set up — no `setup-token`, no API key, no new auth flow.
+**Do you need `claude auth login` first?**
+- **Yes, once** — if you've never logged in before. Run `claude auth login`, complete the browser flow, then run the curl command above.
+- **No** — if you've logged in before (even on another machine session, even if `claude auth status` now shows `loggedIn: false`). The installer picks up whatever valid OAuth tokens exist in `~/.local/share/opencode/auth.json` and takes it from there.
 
-Run the one-line installer, and **you never need to touch auth again**. The installer sets up a background daemon (LaunchAgent on macOS, cron on Linux) that proactively refreshes your OAuth tokens every 2 hours via Anthropic's token endpoint. Each refresh rotates both access and refresh tokens, so the chain stays alive indefinitely. If OAuth refresh ever fails, the daemon falls back to capturing a fresh bearer from your local Claude CLI session.
+After that one-time setup: **you never touch auth again.** The installer sets up a background daemon (LaunchAgent on macOS, cron on Linux) that proactively refreshes your OAuth tokens every 2 hours, and a `claude()` shell wrapper that feeds those tokens to the Claude CLI automatically. Each OAuth refresh rotates both the access and refresh tokens, so the chain stays alive indefinitely.
 
-After it runs, restart OpenCode and you're done:
+After the curl command runs, reload your shell and restart OpenCode:
 
 ```bash
+source ~/.zshrc   # or ~/.bashrc — activates the claude() wrapper
 pkill -x opencode 2>/dev/null; opencode
 ```
 
@@ -96,7 +99,7 @@ Existing keys, other plugins, and other providers are preserved. The rewrite is 
 
 | Tool | Why | Install |
 | --- | --- | --- |
-| [**Claude CLI**](https://docs.claude.com/en/docs/claude-code/overview) | One-time bootstrap — provides the initial OAuth session. | Follow the docs, then `claude login`. |
+| [**Claude CLI**](https://docs.claude.com/en/docs/claude-code/overview) | Provides the OAuth session the installer bootstraps from. Run `claude auth login` once if you've never logged in before. | [Install docs](https://docs.claude.com/en/docs/claude-code/overview) |
 | **Claude Pro or Max subscription** | Without one there's nothing to bill against. | [claude.ai/upgrade](https://claude.ai/upgrade) |
 | [**OpenCode**](https://opencode.ai) | The thing we're patching. | Follow the install instructions at opencode.ai. |
 | **Node.js** | Runs the refresh daemon. Also provides npm. | [nodejs.org](https://nodejs.org/) |
@@ -144,6 +147,9 @@ If OpenCode keeps holding onto a bad auth record after that, clear just the Anth
 ```bash
 python3 -c 'import json,os; p=os.path.expanduser("~/.local/share/opencode/auth.json"); a=json.load(open(p)); a.pop("anthropic", None); json.dump(a, open(p, "w"), indent=2)'
 ```
+
+**Machine was off (or hibernating) for a very long time and now nothing works.**
+The daemon refreshes tokens every 2 hours while the machine is awake, and OAuth refresh tokens from Anthropic have a long TTL (~1 year). Under normal use — sleep, restarts, a week's holiday — you'll never hit this. But if the machine was off for long enough that the refresh token itself expired, re-run the installer or do a one-time `claude auth login` to get a fresh token. The daemon takes it from there and you're back to zero-touch auth indefinitely.
 
 **Daemon not running?**
 Check with `launchctl list | grep opencode-anthropic-auth`. If missing, re-run the installer.
