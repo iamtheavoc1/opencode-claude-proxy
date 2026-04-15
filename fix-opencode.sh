@@ -443,18 +443,20 @@ async function main() {
     const remaining = (entry.expires || 0) - Date.now();
     if (remaining > REFRESH_THRESHOLD_MS) { log(`SKIP: ${(remaining / 3600000).toFixed(1)}h remaining`); return; }
     log(remaining > 0 ? `${(remaining / 60000).toFixed(0)}min remaining — refreshing` : 'Expired — refreshing');
-    if (entry.refresh) {
-        try {
-            const result = await tryOAuthRefresh(entry.refresh);
-            if (result) { store.anthropic = { ...entry, ...result }; writeFileSync(AUTH_PATH, JSON.stringify(store, null, 2) + '\n'); log(`OK (oauth): expires in ${((result.expires - Date.now()) / 3600000).toFixed(1)}h`); return; }
-        } catch (e) { log(`OAuth failed (${e.message}), trying CLI capture`); }
-    }
     try {
         const access = await captureBearer();
         store.anthropic = { ...entry, access, expires: Date.now() + TTL_MS };
         writeFileSync(AUTH_PATH, JSON.stringify(store, null, 2) + '\n');
         log(`OK (cli): expires in ${(TTL_MS / 3600000).toFixed(0)}h`);
-    } catch (e) { log(`FAIL: ${e.message}`); process.exit(1); }
+        return;
+    } catch (e) { log(`CLI capture failed (${e.message}), trying OAuth refresh`); }
+    if (entry.refresh) {
+        try {
+            const result = await tryOAuthRefresh(entry.refresh);
+            if (result) { store.anthropic = { ...entry, ...result }; writeFileSync(AUTH_PATH, JSON.stringify(store, null, 2) + '\n'); log(`OK (oauth): expires in ${((result.expires - Date.now()) / 3600000).toFixed(1)}h`); return; }
+        } catch (e) { log(`FAIL: both CLI and OAuth failed — OAuth: ${e.message}`); process.exit(1); }
+    }
+    log('FAIL: CLI capture failed and no refresh token available'); process.exit(1);
 }
 main();
 REFRESH_JS
