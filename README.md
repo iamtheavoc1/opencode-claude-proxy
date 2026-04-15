@@ -10,7 +10,7 @@ curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth
 
 Re-runnable, idempotent, backs up `~/.config/opencode/opencode.json` before touching it. Works with the OAuth session your `claude login` already set up — no `setup-token`, no API key, no new auth flow.
 
-Run `claude login` once, run the one-line installer, and **you never need to touch auth again**. The installer sets up a background daemon (LaunchAgent on macOS, cron on Linux) that proactively refreshes your OAuth tokens every 2 hours via Anthropic's token endpoint. Each refresh rotates both access and refresh tokens, so the chain stays alive indefinitely. If OAuth refresh ever fails, the daemon falls back to capturing a fresh bearer from your local Claude CLI session.
+Run the one-line installer, and **you never need to touch auth again**. The installer sets up a background daemon (LaunchAgent on macOS, cron on Linux) that proactively refreshes your OAuth tokens every 2 hours via Anthropic's token endpoint. Each refresh rotates both access and refresh tokens, so the chain stays alive indefinitely. If OAuth refresh ever fails, the daemon falls back to capturing a fresh bearer from your local Claude CLI session.
 
 After it runs, restart OpenCode and you're done:
 
@@ -77,12 +77,18 @@ So OpenCode keeps building its multi-block system prompts the normal way, the pl
    - set the default model to `anthropic/claude-sonnet-4-6` if none is set, or if the existing default pointed at one of the removed providers
 
 7. Installs a proactive token refresh daemon:
-   - macOS: LaunchAgent at `~/Library/LaunchAgents/com.opencode-anthropic-auth.refresh.plist`
-   - Linux: cron job (`0 */2 * * *`)
-   - Runs every 2 hours, refreshes via OAuth when the token has < 2 hours remaining
-   - Each refresh rotates both access and refresh tokens — the chain is self-sustaining
-   - Falls back to Claude CLI loopback capture if OAuth refresh fails
-   - Logs to `~/.local/share/opencode-anthropic-auth/refresh.log`
+    - macOS: LaunchAgent at `~/Library/LaunchAgents/com.opencode-anthropic-auth.refresh.plist`
+    - Linux: cron job (`0 */2 * * *`)
+    - Runs every 2 hours, refreshes via OAuth when the token has < 2 hours remaining
+    - Each refresh rotates both access and refresh tokens — the chain is self-sustaining
+    - Falls back to Claude CLI loopback capture if OAuth refresh fails
+    - Logs to `~/.local/share/opencode-anthropic-auth/refresh.log`
+
+8. Installs a `claude()` shell wrapper function in your shell RC file (`.zshrc` or `.bashrc`):
+   - Reads the current OAuth access token from `~/.local/share/opencode/auth.json`
+   - Sets `CLAUDE_CODE_OAUTH_TOKEN` per-invocation before running the real `claude` binary
+   - Works even when `claude auth status` shows `loggedIn: false`
+   - Degrades gracefully: if auth.json is missing, runs `claude` normally without the env var
 
 Existing keys, other plugins, and other providers are preserved. The rewrite is JSON-safe (done in Python, not sed).
 
@@ -166,7 +172,53 @@ Two layers keep your tokens alive:
 2. If within ~1 minute of expiry, refreshes via OAuth or Claude CLI fallback (same logic as the daemon).
 3. If a request returns 401/403/`invalid authentication credentials`, force-refreshes and retries once.
 
-Under normal use the daemon handles everything in the background and you never notice. The plugin's reactive refresh is a safety net in case the daemon misses a cycle. Together they keep the token chain alive indefinitely — you run `claude login` once during setup and never again.
+Under normal use the daemon handles everything in the background and you never notice. The plugin's reactive refresh is a safety net in case the daemon misses a cycle. The shell wrapper adds a third layer for on-demand `claude` invocations, keeping the token chain alive indefinitely.
+
+**Shell wrapper** (on-demand — every `claude` invocation):
+
+1. Reads the current access token from `~/.local/share/opencode/auth.json`.
+2. Sets `CLAUDE_CODE_OAUTH_TOKEN` for that single invocation.
+3. Calls the real `claude` binary. If auth.json is missing or empty, calls `claude` without the env var.
+
+## Claude CLI wrapper
+
+The installer adds a `claude()` function to your shell RC file (`.zshrc` on zsh, `.bashrc`/`.bash_profile` on bash). It wraps the real `claude` binary to automatically supply the OAuth token from `auth.json`:
+
+```bash
+# Added to your shell RC by the installer
+claude() {
+    local __oaa_token
+    __oaa_token=$(python3 -c "
+import json, os, sys
+try:
+    p = os.path.expanduser('~/.local/share/opencode/auth.json')
+    a = json.load(open(p))
+    t = a.get('anthropic', {}).get('access', '')
+    if t: print(t, end='')
+    else: sys.exit(1)
+except: sys.exit(1)
+" 2>/dev/null)
+    if [ -n "$__oaa_token" ]; then
+        CLAUDE_CODE_OAUTH_TOKEN="$__oaa_token" command claude "$@"
+    else
+        command claude "$@"
+    fi
+}
+```
+
+This means `claude --print "hello"` works even when `claude auth status` reports `loggedIn: false` — as long as `auth.json` has a valid token (which the background daemon keeps fresh).
+
+**Verify it's active:**
+```bash
+type claude   # Should print: claude is a function
+```
+
+**If using an unsupported shell** (fish, etc.), add the function manually to your shell config, or set the env var directly:
+```bash
+export CLAUDE_CODE_OAUTH_TOKEN=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.local/share/opencode/auth.json')))['anthropic']['access'])")
+```
+
+The wrapper is injected with idempotent marker comments — re-running the installer updates it in-place without duplicating it.
 
 ## Credits
 
