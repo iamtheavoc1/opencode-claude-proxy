@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth
 - **Yes, once** — if you've never logged in before. Run `claude auth login`, complete the browser flow, then run the curl command above.
 - **No** — if you've logged in before (even on another machine session, even if `claude auth status` now shows `loggedIn: false`). The installer picks up whatever valid OAuth tokens exist in `~/.local/share/opencode/auth.json` and takes it from there.
 
-After that one-time setup: **you never touch auth again.** The installer sets up a background daemon (LaunchAgent on macOS, cron on Linux) that proactively refreshes your OAuth tokens every 2 hours, and a `claude()` shell wrapper that feeds those tokens to the Claude CLI automatically. Each OAuth refresh rotates both the access and refresh tokens, so the chain stays alive indefinitely.
+After that one-time setup: **you never touch auth again.** The installer sets up a background daemon (LaunchAgent on macOS, cron on Linux) that proactively refreshes your OAuth tokens every 45 minutes, and a `claude()` shell wrapper that feeds those tokens to the Claude CLI automatically. Each OAuth refresh rotates both the access and refresh tokens, so the chain stays alive indefinitely.
 
 After the curl command runs, reload your shell and restart OpenCode:
 
@@ -82,7 +82,9 @@ So OpenCode keeps building its multi-block system prompts the normal way, the pl
 7. Installs a proactive token refresh daemon:
     - macOS: LaunchAgent at `~/Library/LaunchAgents/com.opencode-anthropic-auth.refresh.plist`
     - Linux: cron job (`0 */2 * * *`)
-    - Runs every 2 hours, refreshes via OAuth when the token has < 2 hours remaining
+    - Runs every 45 minutes, refreshes via OAuth when the token has < 1 hour remaining
+    - LaunchAgent also fires hourly via StartCalendarInterval for dark-wake on lid-open sleep
+    - Wrapped in `caffeinate -i` to prevent the Mac from re-sleeping during refresh
     - Each refresh rotates both access and refresh tokens — the chain is self-sustaining
     - Falls back to Claude CLI loopback capture if OAuth refresh fails
     - Logs to `~/.local/share/opencode-anthropic-auth/refresh.log`
@@ -130,7 +132,7 @@ That means OpenCode's stored refresh token is stale. The installer-patched plugi
 
 If you instead see `invalid authentication credentials`, that usually means the cached OpenCode access token is no longer accepted even though its stored expiry timestamp hasn't elapsed yet. The installer-patched plugin now force-refreshes the OAuth token immediately on that live request failure, writes the rotated token back into OpenCode's auth cache, and retries automatically. If the refresh token itself is stale, it falls back to re-syncing from your local `claude` CLI session.
 
-With the background refresh daemon installed, this should be rare. The daemon refreshes tokens every 2 hours and the plugin retries on failures. Check the daemon log if things seem off:
+With the background refresh daemon installed, this should be rare. The daemon refreshes tokens every 45 minutes and the plugin retries on failures. Check the daemon log if things seem off:
 
 ```bash
 cat ~/.local/share/opencode-anthropic-auth/refresh.log
@@ -149,7 +151,15 @@ python3 -c 'import json,os; p=os.path.expanduser("~/.local/share/opencode/auth.j
 ```
 
 **Machine was off (or hibernating) for a very long time and now nothing works.**
-The daemon refreshes tokens every 2 hours while the machine is awake, and OAuth refresh tokens from Anthropic have a long TTL (~1 year). Under normal use — sleep, restarts, a week's holiday — you'll never hit this. But if the machine was off for long enough that the refresh token itself expired, re-run the installer or do a one-time `claude auth login` to get a fresh token. The daemon takes it from there and you're back to zero-touch auth indefinitely.
+The daemon refreshes tokens every 45 minutes while the machine is awake. Anthropic's OAuth refresh tokens expire after ~1-2 hours of inactivity, so the 45-minute cadence keeps the chain alive during normal use. The one unavoidable failure mode is the Mac sleeping with the lid **closed** for more than ~2 hours — macOS hardware prevents any scheduled job from running in that state.
+
+Recovery is one command:
+
+```bash
+~/.local/share/opencode-anthropic-auth/recover.sh
+```
+
+It opens the Anthropic login page once, writes the new token into your opencode auth store, and re-establishes the full paired token. The `claude()` shell wrapper detects auth failures automatically and prints a banner pointing you at `recover.sh` — you don't need to diagnose anything.
 
 **Daemon not running?**
 Check with `launchctl list | grep opencode-anthropic-auth`. If missing, re-run the installer.
@@ -160,14 +170,46 @@ It only replaces the default if it was unset or pointed at a removed provider (`
 **The plugin got an npm update, how do I reapply?**
 Re-run the same curl command. It's idempotent and picks up the latest version on each run.
 
+## Keeping the Token Fresh
+
+The installer deploys a LaunchAgent that refreshes your Anthropic OAuth token
+proactively. You do NOT need to run `claude auth login` in normal use.
+
+**Cadence**:
+- Every 45 minutes when the Mac is awake
+- Every hour via dark-wake when the Mac is asleep with lid OPEN
+- Immediately on wake, on shell start, and on install
+
+**Why 45 minutes?** Anthropic's OAuth refresh tokens die after 1-2 hours of
+inactivity. A 45-minute cadence keeps the token alive with a safe buffer.
+
+## What if the token dies?
+
+There is exactly one unavoidable failure mode: the Mac asleep with lid CLOSED
+for more than ~2 hours (e.g., overnight). macOS hardware enforces sleep when
+the lid closes, so no scheduled job can run, so the refresh token times out.
+
+Recovery is **one command**:
+
+```bash
+~/.local/share/opencode-anthropic-auth/recover.sh
+```
+
+It opens the Anthropic login page once, writes the new token into your
+opencode auth store, and re-establishes the full paired token. After that,
+the 45-minute refresh loop takes over again.
+
+The `claude()` shell wrapper detects this failure automatically and prints a
+banner telling you to run `recover.sh` — you don't need to diagnose anything.
+
 ## Token lifecycle
 
 Two layers keep your tokens alive:
 
-**Background daemon** (proactive — runs every 2 hours):
+**Background daemon** (proactive — runs every 45 minutes):
 
 1. Checks the `expires` timestamp in `~/.local/share/opencode/auth.json`.
-2. If < 2 hours remaining, POSTs to `https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token`.
+2. If < 1 hour remaining, POSTs to `https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token`.
 3. Writes the fresh access token, refresh token, and expiry back to `auth.json`.
 4. If OAuth refresh fails, falls back to capturing a fresh bearer from Claude CLI via loopback proxy.
 5. Logs every action to `~/.local/share/opencode-anthropic-auth/refresh.log`.

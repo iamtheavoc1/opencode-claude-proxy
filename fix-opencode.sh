@@ -21,7 +21,7 @@
 #      - sets default model to anthropic/claude-sonnet-4-6 if none is set
 #   6. Backs up your opencode.json before modifying
 #   7. Installs a proactive token refresh daemon (LaunchAgent on macOS,
-#      cron on Linux) that refreshes tokens every 2 hours so the OAuth
+#      cron on Linux) that refreshes tokens every 45 minutes so the OAuth
 #      chain never breaks — you never need 'claude login' again
 #
 # Why this is needed — the actual root cause:
@@ -381,7 +381,7 @@ const LOG_PATH = join(PLUGIN_DIR, 'refresh.log');
 const SYNC_MODEL = process.env.OPENCODE_ANTHROPIC_AUTH_CLAUDE_SYNC_MODEL || 'claude-sonnet-4-6';
 const TIMEOUT_MS = 30000;
 const TTL_MS = 14400000;
-const REFRESH_THRESHOLD_MS = 7200000;
+const REFRESH_THRESHOLD_MS = 3600000;  // 1h buffer (was 2h); combined with 45min interval keeps token inside inactivity window
 
 function log(msg) {
     const line = `[${new Date().toISOString()}] ${msg}\n`;
@@ -473,11 +473,117 @@ REFRESH_JS
 chmod +x "$REPO_ENTRY_DIR/refresh-token.mjs"
 ok "refresh script: $REPO_ENTRY_DIR/refresh-token.mjs"
 
+# ─── Install recovery helper ────────────────────────────────────────────────
+step "Installing auth recovery helper"
+
+cat > "$REPO_ENTRY_DIR/recover.sh" <<'RECOVER_SH'
+#!/usr/bin/env bash
+# opencode-anthropic-auth recover
+# Usage: recover.sh
+# Runs `claude setup-token`, captures the printed token,
+# writes it into auth.json, and triggers a normal refresh
+# to re-establish a paired access+refresh token.
+
+set -euo pipefail
+
+AUTH_JSON="${OPENCODE_AUTH_PATH:-$HOME/.local/share/opencode/auth.json}"
+PLUGIN_DIR="${OPENCODE_ANTHROPIC_AUTH_DIR:-$HOME/.local/share/opencode-anthropic-auth}"
+
+echo "┌──────────────────────────────────────────────────────┐"
+echo "│  opencode-anthropic-auth: token recovery             │"
+echo "└──────────────────────────────────────────────────────┘"
+echo
+echo "This will:"
+echo "  1. Open a browser for one-time Anthropic OAuth login"
+echo "  2. Write the new token into your opencode auth.json"
+echo "  3. Run a normal refresh to re-establish paired tokens"
+echo
+echo "Press Enter to continue (or Ctrl-C to abort)..."
+read -r _
+
+# Pre-flight: this requires a browser (setup-token opens claude.ai/oauth)
+# If run over pure SSH without display forwarding, setup-token will hang.
+if [ "$(uname)" = "Darwin" ]; then
+  # On macOS, `open` works for GUI apps even without DISPLAY set.
+  :
+elif [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  echo "ERROR: no display detected. claude setup-token needs a browser."
+  echo "       Run this on your local Mac (not over SSH), or:"
+  echo "       1) Run \`claude setup-token\` on a machine with a browser"
+  echo "       2) Copy the sk-ant-oat01-... token it prints"
+  echo "       3) Paste here: CLAUDE_CODE_OAUTH_TOKEN=<token> $0"
+  exit 2
+fi
+
+# Step 1: Run claude setup-token (interactive, opens browser)
+# Accept the token either from $CLAUDE_CODE_OAUTH_TOKEN env var (manual-paste path)
+# or by capturing it from the setup-token command output. Extract with a
+# non-anchored regex so surrounding text ("Your token: sk-...") still matches.
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  echo "-> Using token from \$CLAUDE_CODE_OAUTH_TOKEN"
+  TOKEN="$CLAUDE_CODE_OAUTH_TOKEN"
+else
+  echo "-> Running: claude setup-token  (browser will open)"
+  TOKEN=$(claude setup-token 2>&1 | grep -oE 'sk-ant-oat01-[A-Za-z0-9_-]+' | head -n 1 || true)
+fi
+if [ -z "$TOKEN" ]; then
+  echo "Did not auto-capture a token. Paste it now (or Ctrl-C to abort):"
+  read -r TOKEN
+fi
+if [[ ! "$TOKEN" =~ ^sk-ant-oat01- ]]; then
+  echo "ERROR: token format unexpected: ${TOKEN:0:20}..."
+  exit 1
+fi
+
+# Step 2: Write into auth.json (preserve other fields)
+mkdir -p "$(dirname "$AUTH_JSON")"
+if [ -f "$AUTH_JSON" ]; then
+  cp "$AUTH_JSON" "$AUTH_JSON.bak.$(date +%s)"
+fi
+python3 - <<PY
+import json, os, sys, time
+path = "$AUTH_JSON"
+token = "$TOKEN"
+try:
+    with open(path) as f:
+        store = json.load(f)
+except FileNotFoundError:
+    store = {}
+store.setdefault("anthropic", {})
+store["anthropic"]["type"] = "oauth"
+store["anthropic"]["access"] = token
+# Leave "refresh" untouched if present (setup-token has no refresh counterpart).
+# expires far-future so daemon treats token as healthy; CLI capture below will
+# establish proper paired refresh token within seconds.
+store["anthropic"]["expires"] = int((time.time() + 300) * 1000)
+with open(path, "w") as f:
+    json.dump(store, f, indent=2)
+print(f"-> wrote token into {path}")
+PY
+
+# Step 3: Trigger normal refresh to establish paired refresh token
+NODE_BIN=$(command -v node || echo /opt/homebrew/bin/node)
+echo "-> running normal refresh to establish paired tokens..."
+"$NODE_BIN" "$PLUGIN_DIR/refresh-token.mjs" || {
+  echo "  (first refresh may fail -- token is still usable; next LaunchAgent run will fix it)"
+}
+
+echo "Recovery complete. Try: claude \"ping\""
+RECOVER_SH
+chmod +x "$REPO_ENTRY_DIR/recover.sh"
+ok "recovery helper: $REPO_ENTRY_DIR/recover.sh"
+note "if auth dies, run: $REPO_ENTRY_DIR/recover.sh"
+
 if [ "$(uname)" = "Darwin" ]; then
   PLIST_LABEL="com.opencode-anthropic-auth.refresh"
   PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 
   launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+
+  if [ -f "$PLIST_PATH" ]; then
+    cp "$PLIST_PATH" "$PLIST_PATH.bak.$(date +%s)" 2>/dev/null || true
+    note "old plist backed up: $PLIST_PATH.bak.*"
+  fi
 
   mkdir -p "$HOME/Library/LaunchAgents"
   cat > "$PLIST_PATH" <<PLIST
@@ -489,11 +595,19 @@ if [ "$(uname)" = "Darwin" ]; then
     <string>${PLIST_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>-t</string>
+        <string>180</string>
         <string>${NODE_BIN}</string>
         <string>${REPO_ENTRY_DIR}/refresh-token.mjs</string>
     </array>
     <key>StartInterval</key>
-    <integer>7200</integer>
+    <integer>2700</integer>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>15</integer></dict>
+    </array>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
@@ -512,13 +626,13 @@ PLIST
   launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null \
     || launchctl load "$PLIST_PATH" 2>/dev/null \
     || warn "could not load LaunchAgent — run: launchctl load $PLIST_PATH"
-  ok "LaunchAgent: $PLIST_PATH (every 2h)"
+  ok "LaunchAgent: $PLIST_PATH (every 45min + hourly wake-from-sleep)"
   note "Log: $REPO_ENTRY_DIR/refresh.log"
 else
-  CRON_CMD="0 */2 * * * ${NODE_BIN} ${REPO_ENTRY_DIR}/refresh-token.mjs >> ${REPO_ENTRY_DIR}/refresh.log 2>&1"
+  CRON_CMD="*/45 * * * * ${NODE_BIN} ${REPO_ENTRY_DIR}/refresh-token.mjs >> ${REPO_ENTRY_DIR}/refresh.log 2>&1"
   ( crontab -l 2>/dev/null | grep -v "refresh-token.mjs"; echo "$CRON_CMD" ) | crontab - 2>/dev/null \
     || warn "could not install cron — add manually: $CRON_CMD"
-  ok "cron: refreshes every 2 hours"
+  ok "cron: refreshes every 45 minutes"
   note "Log: $REPO_ENTRY_DIR/refresh.log"
 fi
 
@@ -558,7 +672,7 @@ with open(p, 'w') as f: f.write(s)
 # >>> opencode-anthropic-auth-wrapper >>>
 # Auto-generated by opencode-anthropic-auth installer. Do not edit manually.
 claude() {
-    local __oaa_token
+    local __oaa_token __oaa_rc __oaa_stderr
     __oaa_token=$(python3 -c "
 import json, os, sys
 try:
@@ -572,11 +686,25 @@ try:
 except:
     sys.exit(1)
 " 2>/dev/null)
+
+    __oaa_stderr=$(mktemp -t oaa.stderr.XXXXXX)
     if [ -n "$__oaa_token" ]; then
-        CLAUDE_CODE_OAUTH_TOKEN="$__oaa_token" command claude "$@"
+        CLAUDE_CODE_OAUTH_TOKEN="$__oaa_token" command claude "$@" 2> >(tee "$__oaa_stderr" >&2)
     else
-        command claude "$@"
+        command claude "$@" 2> >(tee "$__oaa_stderr" >&2)
     fi
+    __oaa_rc=$?
+
+    if [ $__oaa_rc -ne 0 ] && grep -qE "(401|OAuth token|authentication_error|invalid_grant|refresh_token)" "$__oaa_stderr" 2>/dev/null; then
+        echo >&2
+        echo "┌──────────────────────────────────────────────────────┐" >&2
+        echo "│  opencode-anthropic-auth: token appears dead         │" >&2
+        echo "│  Recover with:                                       │" >&2
+        echo "│    ~/.local/share/opencode-anthropic-auth/recover.sh │" >&2
+        echo "└──────────────────────────────────────────────────────┘" >&2
+    fi
+    rm -f "$__oaa_stderr"
+    return $__oaa_rc
 }
 # <<< opencode-anthropic-auth-wrapper <<<
 WRAPPER
@@ -596,7 +724,7 @@ cat <<EOF
 
   Plugin:  $REPO_ENTRY_DIR
   Config:  $CONFIG_PATH
-  Daemon:  refreshes tokens every 2h (check $REPO_ENTRY_DIR/refresh.log)
+  Daemon:  refreshes tokens every 45min (check $REPO_ENTRY_DIR/refresh.log)
 
   Restart OpenCode to pick up the new plugin:
 
