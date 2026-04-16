@@ -12,7 +12,18 @@ curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth
 - **Yes, once** — if you've never logged in before. Run `claude auth login`, complete the browser flow, then run the curl command above.
 - **No** — if you've logged in before (even on another machine session, even if `claude auth status` now shows `loggedIn: false`). The installer picks up whatever valid OAuth tokens exist in `~/.local/share/opencode/auth.json` and takes it from there.
 
-After that one-time setup: **you never touch auth again.** The installer sets up a background daemon (LaunchAgent on macOS, cron on Linux) that proactively refreshes your OAuth tokens every 45 minutes, and a `claude()` shell wrapper that feeds those tokens to the Claude CLI automatically. Each OAuth refresh rotates both the access and refresh tokens, so the chain stays alive indefinitely.
+After that one-time setup, you have two supported modes:
+
+- **Mac-only mode** (default): `fix-opencode.sh` installs the self-healing plugin, a local refresh daemon, and a `claude()` wrapper.
+- **VPS-offload mode** (recommended if your Mac sleeps a lot): a Linux VPS on your Tailscale tailnet becomes the only canonical refresher, and your Mac becomes a pure consumer that pulls fresh tokens on demand.
+
+The important Claude CLI auth detail is now known and baked into the wrapper: **`CLAUDE_CODE_OAUTH_TOKEN` alone is not enough**. Claude CLI needs all three env vars together:
+
+- `CLAUDE_CODE_OAUTH_TOKEN`
+- `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`
+- `CLAUDE_CODE_OAUTH_SCOPES`
+
+If any of the three is missing, Claude returns `401 Invalid authentication credentials` even when the access token itself looks valid.
 
 After the curl command runs, reload your shell and restart OpenCode:
 
@@ -20,6 +31,43 @@ After the curl command runs, reload your shell and restart OpenCode:
 source ~/.zshrc   # or ~/.bashrc — activates the claude() wrapper
 pkill -x opencode 2>/dev/null; opencode
 ```
+
+## VPS-offload mode
+
+If your real requirement is **"keep auth alive while my Mac is offline/asleep, and do not run refresh work on the Mac during sleep"**, use VPS-offload mode.
+
+1. Provision the VPS daemon from your Mac:
+
+```bash
+bash ./install-vps-daemon.sh <ssh-host>
+```
+
+That script:
+
+- installs `age`, `jq`, `node`, and `tailscale` on the VPS if needed
+- creates the `ocauth` service account and `/opt/ocauth/`
+- deploys the refresh daemon and token server as systemd units
+- migrates your current local OpenCode OAuth pair to the VPS
+- writes a local `~/.local/share/opencode-anthropic-auth/.vps-config`
+
+2. Re-run the main installer in VPS mode:
+
+```bash
+OCAUTH_VPS_HOST=<tailscale-hostname> \
+OCAUTH_TS_IP=<tailscale-ip> \
+OCAUTH_BEARER=<bearer> \
+bash ./fix-opencode.sh
+```
+
+Or, if `install-vps-daemon.sh` already wrote `.vps-config`, just run `fix-opencode.sh` again and it auto-detects VPS mode.
+
+In VPS-offload mode:
+
+- the Mac does **not** run `caffeinate`
+- the Mac does **not** keep a launchd/cron refresh loop alive
+- the VPS refreshes every 30 minutes via systemd timer
+- the `claude()` wrapper pulls from the VPS before each invocation and retries once after a 401
+- public internet access stays closed; the token server binds only to the Tailscale address
 
 ## The root cause — what's actually broken
 
@@ -79,21 +127,24 @@ So OpenCode keeps building its multi-block system prompts the normal way, the pl
    - strip `claude-proxy` and `claude-code` provider entries (both superseded)
    - set the default model to `anthropic/claude-sonnet-4-6` if none is set, or if the existing default pointed at one of the removed providers
 
-7. Installs a proactive token refresh daemon:
-    - macOS: LaunchAgent at `~/Library/LaunchAgents/com.opencode-anthropic-auth.refresh.plist`
-    - Linux: cron job (`0 */2 * * *`)
-    - Runs every 45 minutes, refreshes via OAuth when the token has < 1 hour remaining
-    - LaunchAgent also fires hourly via StartCalendarInterval for dark-wake on lid-open sleep
-    - Wrapped in `caffeinate -i` to prevent the Mac from re-sleeping during refresh
-    - Each refresh rotates both access and refresh tokens — the chain is self-sustaining
-    - Falls back to Claude CLI loopback capture if OAuth refresh fails
-    - Logs to `~/.local/share/opencode-anthropic-auth/refresh.log`
+7. Installs token freshness automation:
+    - **Mac-only mode** (default):
+      - macOS: LaunchAgent at `~/Library/LaunchAgents/com.opencode-anthropic-auth.refresh.plist`
+      - Linux: cron job
+      - Runs every 45 minutes, refreshes via OAuth when the token has < 1 hour remaining
+      - macOS path uses `caffeinate` + a wake-oriented LaunchAgent because the machine itself is the refresher
+    - **VPS-offload mode** (`OCAUTH_VPS_HOST` set, or `.vps-config` already present):
+      - skips the local daemon entirely
+      - unloads the legacy LaunchAgent if one exists
+      - installs `pull-from-vps.sh`, which pulls a fresh OAuth pair over Tailscale on demand
+      - expects a remote systemd timer to refresh every 30 minutes on the VPS
 
 8. Installs a `claude()` shell wrapper function in your shell RC file (`.zshrc` or `.bashrc`):
-   - Reads the current OAuth access token from `~/.local/share/opencode/auth.json`
-   - Sets `CLAUDE_CODE_OAUTH_TOKEN` per-invocation before running the real `claude` binary
-   - Works even when `claude auth status` shows `loggedIn: false`
-   - Degrades gracefully: if auth.json is missing, runs `claude` normally without the env var
+    - Reads the current OAuth access token, refresh token, and expiry from `~/.local/share/opencode/auth.json`
+    - Sets `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, and `CLAUDE_CODE_OAUTH_SCOPES` together
+    - In VPS mode, pulls from the VPS before invocation and retries once after a 401
+    - Works even when `claude auth status` shows `loggedIn: false`
+    - Degrades gracefully: if auth.json is missing, runs `claude` normally without the env vars
 
 Existing keys, other plugins, and other providers are preserved. The rewrite is JSON-safe (done in Python, not sed).
 
@@ -105,8 +156,15 @@ Existing keys, other plugins, and other providers are preserved. The rewrite is 
 | **Claude Pro or Max subscription** | Without one there's nothing to bill against. | [claude.ai/upgrade](https://claude.ai/upgrade) |
 | [**OpenCode**](https://opencode.ai) | The thing we're patching. | Follow the install instructions at opencode.ai. |
 | **Node.js** | Runs the refresh daemon. Also provides npm. | [nodejs.org](https://nodejs.org/) |
+| **jq** | Required for VPS-offload token pulls and payload validation. | Your package manager / `brew install jq` |
 | **python3** | Rewrites `opencode.json` safely. | Preinstalled on macOS and most Linux distros. |
 | **git** | Used by the installer's sanity checks. | Xcode Command Line Tools / your package manager. |
+
+### Extra requirements for VPS-offload mode
+
+- A Linux VPS with `sudo`
+- SSH access to that VPS from your Mac
+- Tailscale on both machines, in the same tailnet
 
 ## Verification
 
@@ -130,9 +188,19 @@ pkill -x opencode 2>/dev/null; opencode
 **Getting `Token refresh failed: 400 — {"error":"invalid_grant", ...}`.**
 That means OpenCode's stored refresh token is stale. The installer-patched plugin now tries to self-heal by borrowing a fresh bearer token from your local `claude` CLI login. If `claude` is still logged in, the next request should recover automatically.
 
-If you instead see `invalid authentication credentials`, that usually means the cached OpenCode access token is no longer accepted even though its stored expiry timestamp hasn't elapsed yet. The installer-patched plugin now force-refreshes the OAuth token immediately on that live request failure, writes the rotated token back into OpenCode's auth cache, and retries automatically. If the refresh token itself is stale, it falls back to re-syncing from your local `claude` CLI session.
+If you instead see `invalid authentication credentials`, there are two common cases:
 
-With the background refresh daemon installed, this should be rare. The daemon refreshes tokens every 45 minutes and the plugin retries on failures. Check the daemon log if things seem off:
+- **Mac-only mode**: the cached access token is no longer accepted even though the stored expiry timestamp has not elapsed yet. The patched plugin force-refreshes immediately and retries.
+- **VPS-offload mode**: the Mac is holding an older token pair than the VPS. Force a pull, then retry:
+
+```bash
+~/.local/share/opencode-anthropic-auth/pull-from-vps.sh
+claude --print "say exactly: AUTH_OK"
+```
+
+The installer wrapper now does this automatically in VPS mode before invocation and once more after a 401.
+
+With either refresh path installed, this should be rare. In Mac-only mode the local daemon refreshes every 45 minutes; in VPS-offload mode the VPS timer refreshes every 30 minutes. The plugin retries on failures. Check the log if things seem off:
 
 ```bash
 cat ~/.local/share/opencode-anthropic-auth/refresh.log
@@ -151,7 +219,10 @@ python3 -c 'import json,os; p=os.path.expanduser("~/.local/share/opencode/auth.j
 ```
 
 **Machine was off (or hibernating) for a very long time and now nothing works.**
-The daemon refreshes tokens every 45 minutes while the machine is awake. Anthropic's OAuth refresh tokens expire after ~1-2 hours of inactivity, so the 45-minute cadence keeps the chain alive during normal use. The one unavoidable failure mode is the Mac sleeping with the lid **closed** for more than ~2 hours — macOS hardware prevents any scheduled job from running in that state.
+
+If you are in **VPS-offload mode**, this is exactly what the VPS is for — the Mac can be completely offline and the token chain still survives because the VPS is doing the refresh work.
+
+If you are in **Mac-only mode**, the daemon only runs while the machine is awake. Anthropic's OAuth refresh tokens expire after ~1-2 hours of inactivity, so the unavoidable failure mode is still the Mac sleeping with the lid **closed** for too long.
 
 Recovery is one command:
 
@@ -172,22 +243,29 @@ Re-run the same curl command. It's idempotent and picks up the latest version on
 
 ## Keeping the Token Fresh
 
-The installer deploys a LaunchAgent that refreshes your Anthropic OAuth token
-proactively. You do NOT need to run `claude auth login` in normal use.
+There are now two token-freshness architectures.
 
-**Cadence**:
-- Every 45 minutes when the Mac is awake
-- Every hour via dark-wake when the Mac is asleep with lid OPEN
-- Immediately on wake, on shell start, and on install
+### 1. Mac-only mode
 
-**Why 45 minutes?** Anthropic's OAuth refresh tokens die after 1-2 hours of
-inactivity. A 45-minute cadence keeps the token alive with a safe buffer.
+- Local LaunchAgent/cron refresh every 45 minutes
+- Plugin refreshes reactively on request failures
+- Works well while the machine is awake
+- Still subject to the lid-closed sleep limitation on macOS hardware
+
+### 2. VPS-offload mode
+
+- VPS systemd timer refreshes every 30 minutes
+- Token server binds only to the Tailscale address
+- Mac runs no refresh daemon while asleep
+- Mac pulls on demand through `pull-from-vps.sh`
+
+If your real goal is "offline-proof and no refresh work during Mac sleep", use VPS-offload mode.
 
 ## What if the token dies?
 
-There is exactly one unavoidable failure mode: the Mac asleep with lid CLOSED
-for more than ~2 hours (e.g., overnight). macOS hardware enforces sleep when
-the lid closes, so no scheduled job can run, so the refresh token times out.
+In **Mac-only mode**, there is exactly one unavoidable failure mode: the Mac asleep with lid CLOSED for more than ~2 hours. macOS hardware enforces sleep when the lid closes, so no scheduled job can run, so the refresh token times out.
+
+In **VPS-offload mode**, that failure mode moves off the Mac. As long as the VPS is up and connected to Tailscale, the token chain stays alive even if the Mac is shut down.
 
 Recovery is **one command**:
 
@@ -206,7 +284,7 @@ banner telling you to run `recover.sh` — you don't need to diagnose anything.
 
 Two layers keep your tokens alive:
 
-**Background daemon** (proactive — runs every 45 minutes):
+**Mac-only daemon** (proactive — runs every 45 minutes):
 
 1. Checks the `expires` timestamp in `~/.local/share/opencode/auth.json`.
 2. If < 1 hour remaining, POSTs to `https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token`.
@@ -220,50 +298,67 @@ Two layers keep your tokens alive:
 2. If within ~1 minute of expiry, refreshes via OAuth or Claude CLI fallback (same logic as the daemon).
 3. If a request returns 401/403/`invalid authentication credentials`, force-refreshes and retries once.
 
-Under normal use the daemon handles everything in the background and you never notice. The plugin's reactive refresh is a safety net in case the daemon misses a cycle. The shell wrapper adds a third layer for on-demand `claude` invocations, keeping the token chain alive indefinitely.
+**VPS-offload daemon** (proactive — runs every 30 minutes on the VPS):
+
+1. Decrypts the stored OAuth token on the VPS.
+2. Refreshes it against `https://platform.claude.com/v1/oauth/token` when < 1 hour remains.
+3. Re-encrypts and stores the rotated access+refresh pair.
+4. Serves the current pair only over a bearer-protected Tailscale-bound HTTP endpoint.
+
+Under normal use, one of these proactive daemons handles freshness and the plugin remains the safety net. The wrapper is the final layer for on-demand `claude` invocations.
 
 **Shell wrapper** (on-demand — every `claude` invocation):
 
-1. Reads the current access token from `~/.local/share/opencode/auth.json`.
-2. Sets `CLAUDE_CODE_OAUTH_TOKEN` for that single invocation.
-3. Calls the real `claude` binary. If auth.json is missing or empty, calls `claude` without the env var.
+1. Reads the current access token, refresh token, and expiry from `~/.local/share/opencode/auth.json`.
+2. In VPS mode, pulls a fresh pair from the VPS before invocation.
+3. Sets `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, and `CLAUDE_CODE_OAUTH_SCOPES` together.
+4. Calls the real `claude` binary.
+5. If Claude still returns a 401, pulls again and retries once.
 
 ## Claude CLI wrapper
 
-The installer adds a `claude()` function to your shell RC file (`.zshrc` on zsh, `.bashrc`/`.bash_profile` on bash). It wraps the real `claude` binary to automatically supply the OAuth token from `auth.json`:
+The installer adds a `claude()` function to your shell RC file (`.zshrc` on zsh, `.bashrc`/`.bash_profile` on bash). It wraps the real `claude` binary to automatically supply the OAuth material from `auth.json`:
 
 ```bash
 # Added to your shell RC by the installer
 claude() {
-    local __oaa_token
-    __oaa_token=$(python3 -c "
+    local __oaa_auth __oaa_access __oaa_refresh
+    local __oaa_pull="$HOME/.local/share/opencode-anthropic-auth/pull-from-vps.sh"
+    [ -x "$__oaa_pull" ] && "$__oaa_pull" >/dev/null 2>&1 || true
+    __oaa_auth=$(python3 -c "
 import json, os, sys
 try:
     p = os.path.expanduser('~/.local/share/opencode/auth.json')
-    a = json.load(open(p))
-    t = a.get('anthropic', {}).get('access', '')
-    if t: print(t, end='')
-    else: sys.exit(1)
+    a = json.load(open(p)).get('anthropic', {})
+    print(a.get('access', ''))
+    print(a.get('refresh', ''))
 except: sys.exit(1)
 " 2>/dev/null)
-    if [ -n "$__oaa_token" ]; then
-        CLAUDE_CODE_OAUTH_TOKEN="$__oaa_token" command claude "$@"
+    __oaa_access=$(printf '%s\n' "$__oaa_auth" | sed -n '1p')
+    __oaa_refresh=$(printf '%s\n' "$__oaa_auth" | sed -n '2p')
+    if [ -n "$__oaa_access" ] && [ -n "$__oaa_refresh" ]; then
+        CLAUDE_CODE_OAUTH_TOKEN="$__oaa_access" \
+        CLAUDE_CODE_OAUTH_REFRESH_TOKEN="$__oaa_refresh" \
+        CLAUDE_CODE_OAUTH_SCOPES="user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload org:create_api_key" \
+        command claude "$@"
     else
         command claude "$@"
     fi
 }
 ```
 
-This means `claude --print "hello"` works even when `claude auth status` reports `loggedIn: false` — as long as `auth.json` has a valid token (which the background daemon keeps fresh).
+This means `claude --print "hello"` works even when `claude auth status` reports `loggedIn: false` — as long as `auth.json` has a valid OAuth pair.
 
 **Verify it's active:**
 ```bash
 type claude   # Should print: claude is a function
 ```
 
-**If using an unsupported shell** (fish, etc.), add the function manually to your shell config, or set the env var directly:
+**If using an unsupported shell** (fish, etc.), add the function manually to your shell config, or export all three vars directly:
 ```bash
 export CLAUDE_CODE_OAUTH_TOKEN=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.local/share/opencode/auth.json')))['anthropic']['access'])")
+export CLAUDE_CODE_OAUTH_REFRESH_TOKEN=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.local/share/opencode/auth.json')))['anthropic']['refresh'])")
+export CLAUDE_CODE_OAUTH_SCOPES='user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload org:create_api_key'
 ```
 
 The wrapper is injected with idempotent marker comments — re-running the installer updates it in-place without duplicating it.
