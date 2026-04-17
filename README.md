@@ -373,7 +373,8 @@ This repo ships three installers/helpers and installs four more scripts into you
 | --- | --- | --- | --- |
 | `fix-opencode.sh` | repo root | Once on each Mac (client) | Installs the `@ex-machina/opencode-anthropic-auth` plugin, patches it for self-healing refresh, rewrites `opencode.json`, installs a Mac-only refresh daemon (or the VPS pull helper in VPS-offload mode), installs the `claude()` shell wrapper, and drops `sync-claude-to-opencode.sh` into `~/.local/bin`. Idempotent — re-run to update. |
 | `install-vps-daemon.sh <ssh-host>` | repo root | Once per VPS | Bootstraps a Linux VPS as the canonical token refresher. Installs `age`/`jq`/`node`/`tailscale`, creates the `ocauth` service account, deploys systemd `ocauth-refresh.service` + `ocauth-refresh.timer` + `ocauth-server.service`, migrates your current local OAuth pair into `/opt/ocauth/token.age`, and writes `~/.local/share/opencode-anthropic-auth/.vps-config` on your Mac (including `OCAUTH_SSH_HOST` for the SSH fallback). |
-| `scripts/sync-claude-to-opencode.sh` | repo `scripts/` | On demand on your Mac | Reads the **fresh** Claude CLI OAuth pair from the macOS Keychain (`Claude Code-credentials`) and mirrors it into `~/.local/share/opencode/auth.json`. Before writing, it calls `api.anthropic.com/api/oauth/usage` to verify the token is actually accepted upstream (expiry timestamps alone are not enough — Anthropic can revoke a token while it still looks valid locally). If the local token is invalid, it auto-refreshes via `claude` CLI; if refresh fails, it tells you to run `claude auth login`. Also supports `--status` (human-readable state + usage meter) and `--version`. |
+| `scripts/sync-claude-to-opencode.sh` | repo `scripts/` | On demand on your Mac | Reads the **fresh** Claude CLI OAuth pair from the macOS Keychain (`Claude Code-credentials`) and mirrors it into `~/.local/share/opencode/auth.json`. Before writing, it calls `api.anthropic.com/api/oauth/usage` to verify the token is actually accepted upstream (expiry timestamps alone are not enough — Anthropic can revoke a token while it still looks valid locally). If the local token is expiring within 10 minutes (`PROACTIVE_REFRESH_MS`) or is invalid, it auto-refreshes via `claude` CLI; if refresh fails, it tells you to run `claude auth login`. Also supports `--status` (human-readable state + usage meter, works even without OpenCode installed) and `--version`. |
+| `scripts/enable-opus-4-7-thinking.sh` | repo `scripts/` | Once, opt-in, on each Mac | Patches `opencode.json` so Claude Opus 4.7 actually **surfaces its extended thinking** in the TUI. Adds `options.thinking = { type: "adaptive", display: "summarized" }` and `options.effort = "xhigh"` under `claude-opus-4-7`, and rewrites the models.dev capability cache (`~/.cache/opencode/models.json`) so the context meter shows the correct 200k default instead of the 1M extended-beta number. Safe to re-run. Supports `--dry-run` and `--revert` (restores from `*.bak-pre-opus47-thinking` backups). See "Enable thinking on Opus 4.7" below for why all three layers are needed. |
 
 ### Installed into your home directory
 
@@ -387,6 +388,7 @@ This repo ships three installers/helpers and installs four more scripts into you
 | `~/.local/share/opencode-anthropic-auth/refresh.log` | daemons + helpers | Append-only | Single source of truth for "what did auth do and when". Inspect this before assuming anything. |
 | `~/.local/bin/sync-claude-to-opencode.sh` | copied by `fix-opencode.sh` | On demand | See `scripts/sync-claude-to-opencode.sh` above. |
 | `~/.local/bin/claude-sync` | symlink to the above | Convenience shortcut | `claude-sync` = run sync, `claude-sync --status` = show state. |
+| `~/.local/bin/enable-opus-4-7-thinking.sh` | copied by `fix-opencode.sh` | Once, opt-in | See `scripts/enable-opus-4-7-thinking.sh` above. |
 | `claude()` shell function in `~/.zshrc` or `~/.bashrc` | injected by `fix-opencode.sh` | Every `claude …` invocation | Reads `auth.json`, exports **all three** `CLAUDE_CODE_OAUTH_*` env vars (token + refresh + scopes — all required), pulls from the VPS first in VPS-offload mode, and retries once on 401. Degrades gracefully to raw `claude` if `auth.json` is missing. |
 
 ### When to reach for which
@@ -397,6 +399,55 @@ This repo ships three installers/helpers and installs four more scripts into you
 - **Mac was off/asleep for hours and nothing works** → In VPS-offload mode: `~/.local/share/opencode-anthropic-auth/pull-from-vps.sh`. In Mac-only mode: `~/.local/share/opencode-anthropic-auth/recover.sh`.
 - **I just want to see how much of my quota I've used** → `claude-sync --status`.
 - **Tailscale is off and I still want the VPS pull to work** → Make sure `OCAUTH_SSH_HOST` is set in `.vps-config` (the installer now does this). `pull-from-vps.sh` will try SSH after fqdn/IP both fail.
+
+## Enable thinking on Opus 4.7
+
+Claude Opus 4.7 supports extended thinking, but you will **not see it** in OpenCode out of the box. There are three separate layers that all have to be in the right state, and the default install only does one of them.
+
+### The three layers
+
+| Layer | What it controls | Default state |
+| --- | --- | --- |
+| **1. Request body**: `thinking: { type: "adaptive", display: "summarized" }` | Whether Claude thinks at all, and whether the thinking text is returned or only its encrypted `signature`. On Opus 4.7, `display` silently defaults to `"omitted"` — you get empty thinking blocks unless you explicitly opt in. | **Not set.** `effort` alone is not enough; `effort` without `thinking: adaptive` is ignored on 4.7. |
+| **2. Beta header**: `anthropic-beta: oauth-2025-04-20,interleaved-thinking-2025-05-14` | Authorizes the OAuth subscription path and enables interleaved thinking (thinking between tool calls). | **Already sent** by `@ex-machina/opencode-anthropic-auth` after `fix-opencode.sh`. |
+| **3. Context cache**: `~/.cache/opencode/models.json` entry for `claude-opus-4-7` | What the OpenCode TUI's context meter uses as the denominator. | Ships as **1M** (extended beta tier). Subscription OAuth accounts are tier-1; the real cap is **200k**. Mismatch makes the "% context used" meter lie. |
+
+### The fix
+
+`scripts/enable-opus-4-7-thinking.sh` does layers 1 and 3 in one command (layer 2 is already covered by the main installer):
+
+```bash
+~/.local/bin/enable-opus-4-7-thinking.sh --dry-run   # preview
+~/.local/bin/enable-opus-4-7-thinking.sh             # apply
+pkill -x opencode 2>/dev/null; opencode              # reload
+```
+
+After apply, your `claude-opus-4-7` entry looks like:
+
+```json
+"claude-opus-4-7": {
+  "limit": { "context": 200000, "output": 128000 },
+  "options": {
+    "effort": "xhigh",
+    "thinking": { "type": "adaptive", "display": "summarized" }
+  }
+}
+```
+
+### Why each field is the way it is
+
+- **`type: "adaptive"`** — Opus 4.7 **rejects** the old `type: "enabled", budget_tokens: N` shape with a 400. Adaptive is the only supported mode on 4.7, and it's also recommended on 4.6 / Sonnet 4.6.
+- **`display: "summarized"`** — On Opus 4.7, `display` silently defaults to `"omitted"`, which means the thinking blocks arrive with empty `thinking` fields. This catches most people. Setting it explicitly restores visible thinking.
+- **`effort: "xhigh"`** — Soft guidance on how hard Claude thinks. `xhigh` is specific to Opus 4.7. `max` also exists but is expensive; `high` is the documented default. Only matters when `thinking.type` is `adaptive`.
+- **`limit.context: 200000`** — The 1M context tier is gated behind the `context-1m-2025-08-07` beta header, a tier 4+ org, and 2x/1.5x pricing above 200k tokens. None of that applies to Claude Pro/Max subscription OAuth. 200k is your actual ceiling.
+
+### Undo
+
+```bash
+~/.local/bin/enable-opus-4-7-thinking.sh --revert
+```
+
+Reverts using the `.bak-pre-opus47-thinking` backups written on first apply.
 
 ## Credits
 

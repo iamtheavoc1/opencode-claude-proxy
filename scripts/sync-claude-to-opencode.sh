@@ -3,7 +3,9 @@ set -euo pipefail
 
 OPENCODE_AUTH="${OPENCODE_AUTH_PATH:-$HOME/.local/share/opencode/auth.json}"
 
-VERSION="0.6.1"
+VERSION="0.6.2"
+
+PROACTIVE_REFRESH_MS=600000
 
 # Suppress normal output when not running in a terminal (e.g. LaunchAgent/cron).
 # Errors and warnings always go to stderr regardless.
@@ -34,15 +36,13 @@ EOF
   exit 0
 fi
 
-[[ ! -f "$OPENCODE_AUTH" ]] && exit 0
 command -v node >/dev/null 2>&1 || { echo "node not found" >&2; exit 1; }
 
-# --- Warn about deprecated cached plugin ---
 DEPRECATED_PLUGIN="$HOME/.cache/opencode/node_modules/opencode-anthropic-auth"
-if [[ -d "$DEPRECATED_PLUGIN" ]]; then
-  echo "⚠️  Deprecated opencode-anthropic-auth plugin detected in cache." >&2
-  echo "   This may cause 429 errors. Remove it with:" >&2
-  echo "   rm -rf $DEPRECATED_PLUGIN" >&2
+if [[ -d "$DEPRECATED_PLUGIN" ]] && [[ "$QUIET" == "0" ]]; then
+  echo "Warning: deprecated opencode-anthropic-auth plugin detected in cache." >&2
+  echo "         This may cause 429 errors. Remove it with:" >&2
+  echo "         rm -rf $DEPRECATED_PLUGIN" >&2
 fi
 
 # --- Read Claude credentials (platform-aware) ---
@@ -64,7 +64,7 @@ read_claude_creds() {
       36)  echo "macOS Keychain is locked. Run: security unlock-keychain ~/Library/Keychains/login.keychain-db" >&2; exit 1 ;;
       128) echo "macOS Keychain access denied. Grant access when prompted." >&2; exit 1 ;;
       *)
-        if [[ $exit_code -eq 143 ]] || echo "$keychain_result" | grep -qi "timeout"; then
+        if echo "$keychain_result" | grep -qi "timeout"; then
           echo "macOS Keychain read timed out. Try restarting Keychain Access." >&2; exit 1
         fi
         ;; # unknown error, fall through to file
@@ -201,10 +201,9 @@ try {
   process.exit(1);
 }
 ")
-  local active_access token_state first_line rest
+  local active_access token_state rest
   active_access=$(extract_access_token "$CLAUDE_JSON")
   token_state=$(token_upstream_state "$active_access")
-  first_line=${status_output%%$'\n'*}
   rest=${status_output#*$'\n'}
 
   if [[ "$token_state" == "invalid" ]]; then
@@ -227,6 +226,10 @@ try {
 # ==========================================================================
 
 do_sync() {
+  if [[ ! -f "$OPENCODE_AUTH" ]]; then
+    exit 0
+  fi
+
   local CLAUDE_JSON
   CLAUDE_JSON=$(read_claude_creds)
 
@@ -236,14 +239,15 @@ do_sync() {
   fi
 
   local NEED_REFRESH active_access token_state
-  NEED_REFRESH=$(echo "$CLAUDE_JSON" | node --input-type=module -e "
+  NEED_REFRESH=$(echo "$CLAUDE_JSON" | PROACTIVE_REFRESH_MS="$PROACTIVE_REFRESH_MS" node --input-type=module -e "
 let input = '';
 for await (const chunk of process.stdin) input += chunk;
+const threshold = parseInt(process.env.PROACTIVE_REFRESH_MS || '0', 10);
 try {
   const raw = JSON.parse(input);
   const creds = raw.claudeAiOauth ?? raw;
   const remaining = (creds.expiresAt || 0) - Date.now();
-  console.log(remaining <= 0 ? 'yes' : 'no');
+  console.log(remaining <= threshold ? 'yes' : 'no');
 } catch { console.log('no'); }
 " 2>/dev/null || echo "no")
 

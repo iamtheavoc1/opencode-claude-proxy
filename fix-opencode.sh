@@ -962,6 +962,32 @@ if [ -f "$SYNC_DEST" ]; then
   note "Run 'claude-sync --status' to check upstream token validity"
 fi
 
+step "Installing Opus 4.7 thinking helper"
+
+THINK_SRC_URL="https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth-fix/main/scripts/enable-opus-4-7-thinking.sh"
+THINK_DEST="$HOME/.local/bin/enable-opus-4-7-thinking.sh"
+
+THINK_LOCAL_SRC="$(dirname "$0")/scripts/enable-opus-4-7-thinking.sh"
+if [ -f "$THINK_LOCAL_SRC" ]; then
+  cp "$THINK_LOCAL_SRC" "$THINK_DEST"
+  ok "copied enable-opus-4-7-thinking.sh from local checkout"
+elif command -v curl >/dev/null 2>&1; then
+  if curl -fsSL "$THINK_SRC_URL" -o "$THINK_DEST.tmp" 2>/dev/null; then
+    mv "$THINK_DEST.tmp" "$THINK_DEST"
+    ok "downloaded enable-opus-4-7-thinking.sh"
+  else
+    rm -f "$THINK_DEST.tmp"
+    warn "could not download thinking helper from $THINK_SRC_URL"
+  fi
+fi
+
+if [ -f "$THINK_DEST" ]; then
+  chmod +x "$THINK_DEST"
+  note "Opt-in to Opus 4.7 thinking (adaptive + display:summarized + 200k context):"
+  note "  $THINK_DEST"
+  note "  Run with --dry-run first, --revert to undo."
+fi
+
 step "Done"
 
 cat <<EOF
