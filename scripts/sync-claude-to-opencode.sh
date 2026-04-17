@@ -3,7 +3,7 @@ set -euo pipefail
 
 OPENCODE_AUTH="${OPENCODE_AUTH_PATH:-$HOME/.local/share/opencode/auth.json}"
 
-VERSION="0.6.2"
+VERSION="0.6.3"
 
 PROACTIVE_REFRESH_MS=600000
 
@@ -82,7 +82,10 @@ read_claude_creds() {
   fi
 }
 
-# --- CLI auto-refresh ---
+read_opencode_auth() {
+  [[ -f "$OPENCODE_AUTH" ]] || return 0
+  cat "$OPENCODE_AUTH"
+}
 
 refresh_via_cli() {
   if ! command -v claude >/dev/null 2>&1; then
@@ -100,8 +103,9 @@ let input = '';
 for await (const chunk of process.stdin) input += chunk;
 try {
   const raw = JSON.parse(input);
-  const creds = raw.claudeAiOauth ?? raw;
+  const creds = raw.anthropic ?? raw.claudeAiOauth ?? raw;
   if (creds.accessToken) console.log(creds.accessToken);
+  else if (creds.access) console.log(creds.access);
 } catch {}
 " 2>/dev/null
 }
@@ -167,24 +171,31 @@ if (usage.seven_day_sonnet?.utilization != null) {
 # ==========================================================================
 
 cmd_status() {
-  local CLAUDE_JSON
+  local CLAUDE_JSON OPENCODE_JSON STATUS_SOURCE
   CLAUDE_JSON=$(read_claude_creds)
-  if [[ -z "$CLAUDE_JSON" ]]; then
+  OPENCODE_JSON=$(read_opencode_auth)
+
+  if [[ -n "$OPENCODE_JSON" ]]; then
+    STATUS_SOURCE="auth.json"
+  elif [[ -n "$CLAUDE_JSON" ]]; then
+    STATUS_SOURCE="claude"
+  else
     echo "No Claude credentials found" >&2
     exit 0
   fi
 
   local status_output
-  status_output=$(echo "$CLAUDE_JSON" | node --input-type=module -e "
-let input = '';
-for await (const chunk of process.stdin) input += chunk;
+  status_output=$(STATUS_SOURCE="$STATUS_SOURCE" CLAUDE_JSON="$CLAUDE_JSON" OPENCODE_JSON="$OPENCODE_JSON" node --input-type=module -e "
 try {
-  const raw = JSON.parse(input);
-  const creds = raw.claudeAiOauth ?? raw;
-  const remaining = (creds.expiresAt || 0) - Date.now();
+  const source = process.env.STATUS_SOURCE;
+  const raw = JSON.parse(source === 'auth.json' ? process.env.OPENCODE_JSON : process.env.CLAUDE_JSON);
+  const creds = source === 'auth.json' ? (raw.anthropic ?? raw) : (raw.claudeAiOauth ?? raw);
+  const expiresAt = source === 'auth.json' ? creds.expires : creds.expiresAt;
+  const remaining = (expiresAt || 0) - Date.now();
   const hours = Math.floor(remaining / 3600000);
   const mins = Math.floor((remaining % 3600000) / 60000);
-  const expires = new Date(creds.expiresAt).toISOString();
+  const expires = new Date(expiresAt).toISOString();
+  console.log('Source:  ' + source);
   if (remaining <= 0) {
     console.log('Status:  EXPIRED');
     console.log('Expired: ' + expires);
@@ -192,7 +203,7 @@ try {
     console.log('Status:  valid (' + hours + 'h ' + mins + 'm remaining)');
     console.log('Expires: ' + expires);
   }
-  if (creds.subscriptionType) {
+  if (source !== 'auth.json' && creds.subscriptionType) {
     const tier = creds.rateLimitTier ? ' (' + creds.rateLimitTier + ')' : '';
     console.log('Plan:    ' + creds.subscriptionType + tier);
   }
@@ -202,7 +213,11 @@ try {
 }
 ")
   local active_access token_state rest
-  active_access=$(extract_access_token "$CLAUDE_JSON")
+  if [[ "$STATUS_SOURCE" == "auth.json" ]]; then
+    active_access=$(extract_access_token "$OPENCODE_JSON")
+  else
+    active_access=$(extract_access_token "$CLAUDE_JSON")
+  fi
   token_state=$(token_upstream_state "$active_access")
   rest=${status_output#*$'\n'}
 
