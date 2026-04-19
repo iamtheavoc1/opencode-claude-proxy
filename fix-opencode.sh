@@ -5,6 +5,10 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/iamtheavoc1/opencode-anthropic-auth-fix/main/fix-opencode.sh | bash
 #
+# Optional install mode override:
+#   OCAUTH_INSTALL_MODE=manual         install helpers + wrapper only (no local daemon)
+#   OCAUTH_INSTALL_MODE=recurring-local  install local recurring refresh automation
+#
 # What it does, in order:
 #   1. Verifies requirements (claude CLI, opencode, npm/git)
 #   2. Downloads @ex-machina/opencode-anthropic-auth from npm (the only plugin
@@ -20,9 +24,9 @@
 #      - adds the ex-machina plugin via file:// reference
 #      - sets default model to anthropic/claude-sonnet-4-6 if none is set
 #   6. Backs up your opencode.json before modifying
-#   7. Installs a proactive token refresh daemon (LaunchAgent on macOS,
+#   7. Optionally installs a proactive token refresh daemon (LaunchAgent on macOS,
 #      cron on Linux) that refreshes tokens every 45 minutes so the OAuth
-#      chain never breaks — you never need 'claude login' again
+#      chain rarely breaks while the local machine is awake
 #
 # Why this is needed — the actual root cause:
 #
@@ -66,6 +70,12 @@ elif [ -f "$VPS_CONFIG" ] && [ "${OCAUTH_FORCE_MAC_MODE:-}" != "1" ]; then
 else
   MODE="mac-only"
 fi
+
+INSTALL_MODE="${OCAUTH_INSTALL_MODE:-recurring-local}"
+case "$INSTALL_MODE" in
+  manual|recurring-local) ;;
+  *) printf 'unsupported OCAUTH_INSTALL_MODE=%s (expected: manual or recurring-local)\n' "$INSTALL_MODE" >&2; exit 1 ;;
+esac
 
 c_green()  { printf '\033[32m%s\033[0m' "$1"; }
 c_red()    { printf '\033[31m%s\033[0m' "$1"; }
@@ -126,6 +136,12 @@ step "Installing $NPM_PKG to $REPO_ENTRY_DIR"
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
+
+TMP_VPS_CONFIG=""
+if [ -f "$VPS_CONFIG" ]; then
+  TMP_VPS_CONFIG="$TMPDIR/.vps-config.preserve"
+  cp "$VPS_CONFIG" "$TMP_VPS_CONFIG"
+fi
 (
   cd "$TMPDIR"
   "$NPM_BIN" pack "$NPM_PKG" --silent 2>/dev/null || fail "failed to download $NPM_PKG from npm"
@@ -139,6 +155,7 @@ tar -xzf "$TARBALL" -C "$TMPDIR" || fail "failed to extract $TARBALL"
 mkdir -p "$(dirname "$REPO_ENTRY_DIR")"
 rm -rf "$REPO_ENTRY_DIR"
 mv "$TMPDIR/package" "$REPO_ENTRY_DIR"
+[ -n "$TMP_VPS_CONFIG" ] && cp "$TMP_VPS_CONFIG" "$VPS_CONFIG"
 
 [ -f "$REPO_ENTRY_DIR/dist/index.js" ] || fail "extracted plugin is missing dist/index.js"
 ok "installed to $REPO_ENTRY_DIR"
@@ -591,6 +608,406 @@ chmod +x "$REPO_ENTRY_DIR/recover.sh"
 ok "recovery helper: $REPO_ENTRY_DIR/recover.sh"
 note "if auth dies, run: $REPO_ENTRY_DIR/recover.sh"
 
+# ─── Install auth reset helper ────────────────────────────────────────────────
+step "Installing auth reset helper"
+
+cat > "$REPO_ENTRY_DIR/reset.sh" <<'RESET_SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTH_JSON="${OPENCODE_AUTH_PATH:-$HOME/.local/share/opencode/auth.json}"
+
+if [ "${1:-}" != "--yes" ]; then
+  echo "This deletes the stored Anthropic OAuth entry from: $AUTH_JSON"
+  echo "Use this when you want a clean slate before logging in again."
+  echo
+  echo "Run again with: $0 --yes"
+  exit 1
+fi
+
+python3 - <<PY
+import json, os
+path = os.path.expanduser(${AUTH_JSON@Q})
+if not os.path.exists(path):
+    print(f"No auth file at {path}; nothing to delete.")
+    raise SystemExit(0)
+with open(path) as f:
+    data = json.load(f)
+if 'anthropic' in data:
+    data.pop('anthropic', None)
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+    print(f"Deleted anthropic OAuth entry from {path}")
+else:
+    print(f"No anthropic OAuth entry found in {path}")
+PY
+
+echo
+echo "Next steps:"
+echo "  1. Run: claude auth login"
+echo "  2. Run: $HOME/.local/share/opencode-anthropic-auth/recover.sh"
+echo "  3. Retry your Claude/OpenCode command"
+RESET_SH
+
+chmod +x "$REPO_ENTRY_DIR/reset.sh"
+ok "reset helper: $REPO_ENTRY_DIR/reset.sh"
+note "clean slate: $REPO_ENTRY_DIR/reset.sh --yes"
+
+# ─── Install unified doctor ─────────────────────────────────────────────────
+step "Installing unified doctor (status/refresh/doctor/env)"
+
+cat > "$REPO_ENTRY_DIR/doctor.mjs" <<'DOCTOR_JS'
+#!/usr/bin/env node
+// opencode-anthropic-auth doctor
+// Single entrypoint for Anthropic OAuth token health.
+//
+// Subcommands:
+//   status  [--json] [--verbose]   diagnose only; exit reflects state
+//   refresh [--force] [--json]     force a refresh (or noop if HEALTHY)
+//   doctor  [--fix]  [--json]      diagnose; if --fix, auto-remediate up to relogin boundary
+//   env                            emit shell exports (CLAUDE_CODE_OAUTH_* ) if HEALTHY, else exit nonzero
+//
+// Exit codes:
+//   0  HEALTHY (or fixed to HEALTHY)
+//   1  FIXABLE (near-expiry, transient, VPS stale, VPS unreachable, network down)
+//   2  TERMINAL (refresh token dead, auth.json missing/corrupt, must re-login)
+
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const HOME = homedir();
+const PLUGIN_DIR = process.env.OPENCODE_ANTHROPIC_AUTH_DIR || join(HOME, '.local/share/opencode-anthropic-auth');
+const AUTH_PATH = process.env.OPENCODE_AUTH_PATH || join(HOME, '.local/share/opencode/auth.json');
+const VPS_CONFIG = join(PLUGIN_DIR, '.vps-config');
+const PULL_SCRIPT = join(PLUGIN_DIR, 'pull-from-vps.sh');
+const RECOVER_SCRIPT = join(PLUGIN_DIR, 'recover.sh');
+const RESET_SCRIPT = join(PLUGIN_DIR, 'reset.sh');
+const LOG_PATH = join(PLUGIN_DIR, 'refresh.log');
+const FRESH_MS = 10 * 60 * 1000;
+
+const FALLBACK_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const FALLBACK_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
+const DEFAULT_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload org:create_api_key';
+
+const STATES = {
+  HEALTHY:            { exit: 0, glyph: '✓', msg: 'token fresh' },
+  NEEDS_REFRESH:      { exit: 1, glyph: '⚠', msg: 'token near expiry, refresh token present' },
+  VPS_STALE:          { exit: 1, glyph: '⚠', msg: 'VPS mode; local token behind VPS, pull needed' },
+  VPS_UNREACHABLE:    { exit: 1, glyph: '⚠', msg: 'VPS mode; VPS unreachable via Tailnet' },
+  AUTH_JSON_MISSING:  { exit: 2, glyph: '✗', msg: 'auth.json not found' },
+  AUTH_JSON_CORRUPT:  { exit: 2, glyph: '✗', msg: 'auth.json is not valid JSON' },
+  NO_ANTHROPIC_ENTRY: { exit: 2, glyph: '✗', msg: 'auth.json has no anthropic oauth entry' },
+  REFRESH_TOKEN_DEAD: { exit: 2, glyph: '✗', msg: 'refresh token rejected — must re-login' },
+  TRANSIENT:          { exit: 1, glyph: '⚠', msg: 'transient upstream error' },
+  NETWORK_DOWN:       { exit: 1, glyph: '⚠', msg: 'network unreachable' },
+};
+
+function log(msg) {
+  const line = `[${new Date().toISOString()}] doctor: ${msg}\n`;
+  try { appendFileSync(LOG_PATH, line); } catch {}
+}
+
+function readVpsConfig() {
+  if (!existsSync(VPS_CONFIG)) return null;
+  const cfg = {};
+  for (const line of readFileSync(VPS_CONFIG, 'utf8').split('\n')) {
+    const m = line.match(/^([A-Z_]+)=(.*)$/);
+    if (m) cfg[m[1]] = m[2].trim();
+  }
+  return cfg;
+}
+
+function readAuth() {
+  if (!existsSync(AUTH_PATH)) return { state: 'AUTH_JSON_MISSING' };
+  let raw;
+  try { raw = readFileSync(AUTH_PATH, 'utf8'); }
+  catch (e) { return { state: 'AUTH_JSON_CORRUPT', error: String(e.message || e) }; }
+  let json;
+  try { json = JSON.parse(raw); }
+  catch (e) { return { state: 'AUTH_JSON_CORRUPT', error: String(e.message || e) }; }
+  const entry = json && json.anthropic;
+  if (!entry || entry.type !== 'oauth') return { state: 'NO_ANTHROPIC_ENTRY', json };
+  return { json, entry };
+}
+
+function writeAuth(json) {
+  writeFileSync(AUTH_PATH, JSON.stringify(json, null, 2) + '\n');
+}
+
+function classifyOAuthError(status, bodyText) {
+  const lower = (bodyText || '').toLowerCase();
+  if (status === 400 && (lower.includes('invalid_grant') || lower.includes('invalid_scope') || lower.includes('refresh token'))) return 'REFRESH_TOKEN_DEAD';
+  if (status === 401 && (lower.includes('authentication_error') || lower.includes('invalid authentication credentials') || lower.includes('oauth token'))) return 'REFRESH_TOKEN_DEAD';
+  if (status === 529 || status === 503 || status === 504) return 'TRANSIENT';
+  return 'TRANSIENT';
+}
+
+async function loadConstants() {
+  try {
+    const mod = await import(pathToFileURL(join(PLUGIN_DIR, 'dist/constants.js')).href);
+    return { CLIENT_ID: mod.CLIENT_ID || FALLBACK_CLIENT_ID, TOKEN_URL: mod.TOKEN_URL || FALLBACK_TOKEN_URL };
+  } catch {
+    return { CLIENT_ID: FALLBACK_CLIENT_ID, TOKEN_URL: FALLBACK_TOKEN_URL };
+  }
+}
+
+async function oauthRefresh(refreshToken) {
+  const { CLIENT_ID, TOKEN_URL } = await loadConstants();
+  let res;
+  try {
+    res = await fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/plain, */*', 'User-Agent': 'axios/1.13.6' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: CLIENT_ID }),
+    });
+  } catch (e) {
+    return { ok: false, state: 'NETWORK_DOWN', error: String(e.message || e) };
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    return { ok: false, state: classifyOAuthError(res.status, body), status: res.status, body: body.slice(0, 400) };
+  }
+  let json;
+  try { json = await res.json(); }
+  catch (e) { return { ok: false, state: 'TRANSIENT', error: String(e.message || e) }; }
+  return { ok: true, access: json.access_token, refresh: json.refresh_token || refreshToken, expires: Date.now() + (json.expires_in || 28800) * 1000 };
+}
+
+function pullFromVps() {
+  if (!existsSync(PULL_SCRIPT)) return { ok: false, reason: 'pull script missing' };
+  const res = spawnSync(PULL_SCRIPT, [], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
+  if (res.error) return { ok: false, reason: String(res.error.message || res.error) };
+  if (res.status === 0) return { ok: true };
+  return { ok: false, exitCode: res.status, stderr: (res.stderr?.toString() || '').slice(0, 400) };
+}
+
+async function diagnose() {
+  const auth = readAuth();
+  const vps = readVpsConfig();
+  const mode = vps ? 'vps-offload' : 'mac-only';
+  if (auth.state) return { state: auth.state, mode, vps_configured: Boolean(vps), error: auth.error };
+  const { entry } = auth;
+  const now = Date.now();
+  const expires = entry.expires || 0;
+  const remainingMs = expires - now;
+  const base = {
+    mode,
+    vps_configured: Boolean(vps),
+    auth_path: AUTH_PATH,
+    expires_at: expires ? new Date(expires).toISOString() : null,
+    remaining_sec: Math.round(remainingMs / 1000),
+    remaining_min: Math.round(remainingMs / 60000),
+    remaining_hours: Math.round((remainingMs / 3600000) * 10) / 10,
+    has_refresh_token: Boolean(entry.refresh),
+  };
+  if (remainingMs > FRESH_MS) return { state: 'HEALTHY', ...base };
+  if (mode === 'vps-offload') return { state: 'VPS_STALE', ...base };
+  return { state: 'NEEDS_REFRESH', ...base };
+}
+
+async function localRefreshFlow() {
+  const auth = readAuth();
+  if (auth.state) return { fixed: false, newState: auth.state };
+  if (!auth.entry.refresh) return { fixed: false, newState: 'REFRESH_TOKEN_DEAD', detail: 'no refresh token in auth.json' };
+  const result = await oauthRefresh(auth.entry.refresh);
+  if (result.ok) {
+    auth.json.anthropic = { ...auth.entry, access: result.access, refresh: result.refresh, expires: result.expires };
+    writeAuth(auth.json);
+    const h = Math.round(((result.expires - Date.now()) / 3600000) * 10) / 10;
+    log(`fix(local): OAuth refresh OK, expires in ${h}h`);
+    return { fixed: true, newState: 'HEALTHY' };
+  }
+  log(`fix(local): OAuth refresh failed state=${result.state} status=${result.status || '-'} body=${(result.body || result.error || '').toString().slice(0, 200)}`);
+  return { fixed: false, newState: result.state, detail: result.body || result.error };
+}
+
+async function attemptFix(diag) {
+  if (diag.state === 'HEALTHY') return { fixed: true, newState: 'HEALTHY' };
+
+  if (diag.state === 'VPS_STALE' || diag.state === 'VPS_UNREACHABLE') {
+    const pull = pullFromVps();
+    if (pull.ok) {
+      const after = await diagnose();
+      if (after.state === 'HEALTHY') {
+        log('fix(vps): pull-from-vps → HEALTHY');
+        return { fixed: true, newState: 'HEALTHY' };
+      }
+      if (after.has_refresh_token) return localRefreshFlow();
+      return { fixed: false, newState: after.state, detail: 'VPS pull succeeded but result not HEALTHY' };
+    }
+    log(`fix(vps): pull-from-vps failed exit=${pull.exitCode || '-'} stderr=${(pull.stderr || pull.reason || '').toString().slice(0, 200)}`);
+    if (diag.has_refresh_token) return localRefreshFlow();
+    return { fixed: false, newState: 'VPS_UNREACHABLE', detail: pull.stderr || pull.reason };
+  }
+
+  if (diag.state === 'NEEDS_REFRESH') return localRefreshFlow();
+
+  return { fixed: false, newState: diag.state, detail: 'state is terminal, requires re-login' };
+}
+
+function suggestedAction(state) {
+  switch (state) {
+    case 'HEALTHY': return null;
+    case 'NEEDS_REFRESH': return 'run: node ' + join(PLUGIN_DIR, 'doctor.mjs') + ' doctor --fix';
+    case 'VPS_STALE':
+    case 'VPS_UNREACHABLE': return 'run: ' + PULL_SCRIPT;
+    case 'AUTH_JSON_MISSING':
+    case 'AUTH_JSON_CORRUPT':
+    case 'NO_ANTHROPIC_ENTRY':
+    case 'REFRESH_TOKEN_DEAD': return 'run: ' + RECOVER_SCRIPT;
+    case 'NETWORK_DOWN':
+    case 'TRANSIENT': return 'retry later (transient upstream or network error)';
+    default: return null;
+  }
+}
+
+function nextSteps(state) {
+  switch (state) {
+    case 'HEALTHY':
+      return [];
+    case 'NEEDS_REFRESH':
+      return [
+        `1. Run: node ${join(PLUGIN_DIR, 'doctor.mjs')} doctor --fix`,
+        '2. Retry your Claude/OpenCode command',
+      ];
+    case 'VPS_STALE':
+    case 'VPS_UNREACHABLE':
+      return [
+        `1. Run: ${PULL_SCRIPT}`,
+        '2. If that fails, check Tailscale / SSH / VPS health',
+        '3. Retry your Claude/OpenCode command',
+      ];
+    case 'AUTH_JSON_MISSING':
+    case 'NO_ANTHROPIC_ENTRY':
+      return [
+        '1. Run: claude auth login',
+        `2. Run: ${RECOVER_SCRIPT}`,
+        '3. Retry your Claude/OpenCode command',
+      ];
+    case 'AUTH_JSON_CORRUPT':
+      return [
+        `1. Inspect or remove: ${AUTH_PATH}`,
+        '2. Run: claude auth login',
+        `3. Run: ${RECOVER_SCRIPT}`,
+      ];
+    case 'REFRESH_TOKEN_DEAD':
+      return [
+        '1. Run: claude auth login',
+        `2. Run: ${RECOVER_SCRIPT}`,
+        `3. If you want a clean slate first: ${RESET_SCRIPT} --yes`,
+        '4. Retry your Claude/OpenCode command',
+      ];
+    case 'NETWORK_DOWN':
+      return [
+        '1. Reconnect to the internet or tailnet',
+        '2. Retry later with: node ' + join(PLUGIN_DIR, 'doctor.mjs') + ' refresh --force',
+      ];
+    case 'TRANSIENT':
+      return [
+        '1. Wait a minute and retry',
+        '2. If it keeps happening, run: node ' + join(PLUGIN_DIR, 'doctor.mjs') + ' refresh --force',
+      ];
+    default:
+      return [];
+  }
+}
+
+function formatHuman(diag, fixResult) {
+  const info = STATES[diag.state] || { glyph: '?', msg: 'unknown state' };
+  const out = [];
+  out.push(`${info.glyph}  ${diag.state}  —  ${info.msg}`);
+  if (diag.mode) out.push(`   mode: ${diag.mode}`);
+  if (diag.auth_path) out.push(`   auth: ${diag.auth_path}`);
+  if (diag.expires_at) out.push(`   expires: ${diag.expires_at} (${diag.remaining_hours}h remaining)`);
+  if (diag.has_refresh_token !== undefined) out.push(`   refresh_token: ${diag.has_refresh_token ? 'present' : 'missing'}`);
+  if (diag.error) out.push(`   error: ${diag.error}`);
+  if (fixResult) {
+    out.push('');
+    if (fixResult.fixed) out.push(`→ fixed → ${fixResult.newState}`);
+    else out.push(`→ could not fix (${fixResult.newState})${fixResult.detail ? ': ' + fixResult.detail : ''}`);
+  }
+  const next = suggestedAction(fixResult?.newState || diag.state);
+  if (next) { out.push(''); out.push(`next: ${next}`); }
+  const steps = nextSteps(fixResult?.newState || diag.state);
+  if (steps.length) {
+    out.push('');
+    out.push('what to do:');
+    for (const step of steps) out.push(`   ${step}`);
+  }
+  return out.join('\n');
+}
+
+function shellEsc(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const sub = argv[0] || 'status';
+  const flags = new Set(argv.slice(1));
+  const json = flags.has('--json');
+  const fix = flags.has('--fix');
+  const force = flags.has('--force');
+
+  if (sub === 'status') {
+    const diag = await diagnose();
+    if (json) process.stdout.write(JSON.stringify({ ...diag, suggested_action: suggestedAction(diag.state), next_steps: nextSteps(diag.state) }, null, 2) + '\n');
+    else process.stdout.write(formatHuman(diag) + '\n');
+    process.exit((STATES[diag.state] || { exit: 2 }).exit);
+  }
+
+  if (sub === 'refresh') {
+    let diag = await diagnose();
+    if (!force && diag.state === 'HEALTHY') {
+      if (json) process.stdout.write(JSON.stringify({ ...diag, action: 'noop' }, null, 2) + '\n');
+      else process.stdout.write(`${STATES.HEALTHY.glyph}  HEALTHY  —  noop (use --force to refresh anyway)\n`);
+      process.exit(0);
+    }
+    const fixResult = await attemptFix(force ? { ...diag, state: diag.state === 'HEALTHY' ? 'NEEDS_REFRESH' : diag.state } : diag);
+    diag = await diagnose();
+    const effectiveState = fixResult && !fixResult.fixed ? fixResult.newState : diag.state;
+    if (json) process.stdout.write(JSON.stringify({ ...diag, effective_state: effectiveState, fix_result: fixResult, suggested_action: suggestedAction(effectiveState), next_steps: nextSteps(effectiveState) }, null, 2) + '\n');
+    else process.stdout.write(formatHuman({ ...diag, state: effectiveState }, fixResult) + '\n');
+    process.exit((STATES[effectiveState] || { exit: 2 }).exit);
+  }
+
+  if (sub === 'doctor') {
+    let diag = await diagnose();
+    let fixResult = null;
+    if (fix && diag.state !== 'HEALTHY') { fixResult = await attemptFix(diag); diag = await diagnose(); }
+    const effectiveState = fixResult && !fixResult.fixed ? fixResult.newState : diag.state;
+    if (json) process.stdout.write(JSON.stringify({ ...diag, effective_state: effectiveState, fix_result: fixResult, suggested_action: suggestedAction(effectiveState), next_steps: nextSteps(effectiveState) }, null, 2) + '\n');
+    else process.stdout.write(formatHuman({ ...diag, state: effectiveState }, fixResult) + '\n');
+    process.exit((STATES[effectiveState] || { exit: 2 }).exit);
+  }
+
+  if (sub === 'env') {
+    const diag = await diagnose();
+    if (diag.state !== 'HEALTHY') process.exit(1);
+    const auth = readAuth();
+    if (auth.state) process.exit(2);
+    process.stdout.write(`export CLAUDE_CODE_OAUTH_TOKEN=${shellEsc(auth.entry.access)}\n`);
+    process.stdout.write(`export CLAUDE_CODE_OAUTH_REFRESH_TOKEN=${shellEsc(auth.entry.refresh)}\n`);
+    process.stdout.write(`export CLAUDE_CODE_OAUTH_SCOPES=${shellEsc(DEFAULT_SCOPES)}\n`);
+    process.exit(0);
+  }
+
+  process.stderr.write('usage: doctor.mjs <status|refresh|doctor|env> [--json] [--verbose] [--fix] [--force]\n');
+  process.exit(64);
+}
+
+main().catch(e => { process.stderr.write(`doctor: fatal: ${e.stack || e.message}\n`); process.exit(2); });
+DOCTOR_JS
+
+chmod +x "$REPO_ENTRY_DIR/doctor.mjs"
+ok "doctor: $REPO_ENTRY_DIR/doctor.mjs"
+note "status: node $REPO_ENTRY_DIR/doctor.mjs status [--json]"
+note "fix:    node $REPO_ENTRY_DIR/doctor.mjs doctor --fix"
+note "force:  node $REPO_ENTRY_DIR/doctor.mjs refresh --force"
+note "exit:   0 healthy | 1 fixable | 2 must-relogin"
+
 if [ "$MODE" = "vps-offload" ]; then
   step "Skipping local refresh daemon (VPS-offload mode)"
   note "VPS handles token refresh on a 30-minute systemd timer."
@@ -608,6 +1025,10 @@ if [ "$MODE" = "vps-offload" ]; then
   else
     (crontab -l 2>/dev/null | grep -v "refresh-token.mjs" || true) | crontab - 2>/dev/null || true
   fi
+elif [ "$INSTALL_MODE" = "manual" ]; then
+  step "Skipping local refresh daemon (manual mode)"
+  note "Manual mode installs the wrapper and doctor only."
+  note "Refresh manually with: node $REPO_ENTRY_DIR/doctor.mjs refresh --force"
 elif [ "$(uname)" = "Darwin" ]; then
   PLIST_LABEL="com.opencode-anthropic-auth.refresh"
   PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
@@ -989,10 +1410,14 @@ cat <<EOF
   Plugin:  $REPO_ENTRY_DIR
   Config:  $CONFIG_PATH
   Mode:    $MODE
+  Install: $INSTALL_MODE
 
 $(if [ "$MODE" = "vps-offload" ]; then cat <<MODE_EOF
   VPS:     canonical refresh runs on your Tailscale VPS
   Pull:    on-demand via $REPO_ENTRY_DIR/pull-from-vps.sh
+MODE_EOF
+elif [ "$INSTALL_MODE" = "manual" ]; then cat <<MODE_EOF
+  Manual:  no local daemon installed; use doctor.mjs when you want a one-shot refresh
 MODE_EOF
 else cat <<MODE_EOF
   Daemon:  refreshes tokens every 45min (check $REPO_ENTRY_DIR/refresh.log)
@@ -1009,6 +1434,6 @@ fi)
     opencode run "say hi" --model anthropic/claude-sonnet-4-6
 
   Re-run this installer any time to update or re-apply.
-  You should never need 'claude login' again.
+  If Anthropic revokes the refresh chain, one new 'claude auth login' is still required.
 
 EOF

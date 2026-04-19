@@ -6,6 +6,13 @@ DOCTOR="$PLUGIN_DIR/doctor.mjs"
 PULL="$PLUGIN_DIR/pull-from-vps.sh"
 RECOVER="$PLUGIN_DIR/recover.sh"
 RESET="$PLUGIN_DIR/reset.sh"
+SYNC_SCRIPT="${OCAUTH_SYNC_SCRIPT:-$HOME/.local/bin/claude-sync}"
+
+sync_local_auth() {
+  if [[ -x "$SYNC_SCRIPT" ]]; then
+    "$SYNC_SCRIPT" >/dev/null 2>&1 || true
+  fi
+}
 
 find_real_claude() {
   if [[ -n "${CLAUDE_REAL_BIN:-}" && -x "$CLAUDE_REAL_BIN" ]]; then
@@ -48,7 +55,12 @@ fi
 
 case "${1:-}" in
   auth|setup-token|mcp)
-    exec "$REAL_CLAUDE" "$@"
+    "$REAL_CLAUDE" "$@"
+    RC=$?
+    if [[ $RC -eq 0 ]]; then
+      sync_local_auth
+    fi
+    exit $RC
     ;;
 esac
 
@@ -68,6 +80,11 @@ get_env_exports() {
 
 NODE_NO_WARNINGS=1 "$NODE_BIN" "$DOCTOR" doctor --fix >/dev/null 2>&1 || true
 ENV_EXPORTS=$(get_env_exports)
+
+if [[ -z "$ENV_EXPORTS" && -x "$PULL" ]]; then
+  sync_local_auth
+  ENV_EXPORTS=$(get_env_exports)
+fi
 
 if [[ -z "$ENV_EXPORTS" && -x "$PULL" ]]; then
   "$PULL" >/dev/null 2>&1 || true
@@ -99,6 +116,17 @@ run_claude() {
 run_claude "$@"
 RC=$?
 sleep 0.1
+
+if [[ $RC -ne 0 ]] && grep -qE '(401|OAuth token|authentication_error|invalid_grant|refresh_token|invalid authentication credentials)' "$OUT" 2>/dev/null; then
+  sync_local_auth
+  ENV_EXPORTS=$(get_env_exports)
+  if [[ -n "$ENV_EXPORTS" ]]; then
+    : > "$OUT"
+    run_claude "$@"
+    RC=$?
+    sleep 0.1
+  fi
+fi
 
 if [[ $RC -ne 0 ]] && grep -qE '(401|OAuth token|authentication_error|invalid_grant|refresh_token|invalid authentication credentials)' "$OUT" 2>/dev/null; then
   [[ -x "$PULL" ]] && "$PULL" >/dev/null 2>&1 || true
