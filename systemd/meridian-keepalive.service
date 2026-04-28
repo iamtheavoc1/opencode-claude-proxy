@@ -1,0 +1,12 @@
+[Unit]
+Description=Meridian OAuth keepalive — issues a 1-token request to keep the Anthropic OAuth refresh chain warm
+Requires=meridian.service
+After=meridian.service
+
+[Service]
+Type=oneshot
+User=meridian
+Group=meridian
+Environment=MERIDIAN_PORT=3456
+Environment=MERIDIAN_HOST=127.0.0.1
+ExecStart=/usr/bin/env bash -c '/usr/bin/curl -fsS -m 30 -X POST "http://${MERIDIAN_HOST}:${MERIDIAN_PORT}/v1/messages" -H "content-type: application/json" -H "anthropic-version: 2023-06-01" -H "x-api-key: x" -d "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ok\"}]}" >/dev/null'

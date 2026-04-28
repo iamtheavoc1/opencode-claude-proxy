@@ -1,14 +1,18 @@
 {
   "name": "opencode-claude-proxy",
-  "version": "0.1.0",
-  "description": "Local OpenCode provider that proxies LLM calls through the Claude CLI binary so Anthropic models bill against your Claude subscription.",
+  "version": "1.0.0",
+  "description": "Curated installer + service setup that wires opencode to a local meridian proxy so Anthropic traffic bills against your Claude Pro / Max subscription. Includes VPS deploy with auto-refresh OAuth.",
   "keywords": [
     "opencode",
     "claude",
     "claude-code",
-    "ai-sdk",
     "anthropic",
-    "provider"
+    "meridian",
+    "proxy",
+    "claude-pro",
+    "claude-max",
+    "oauth",
+    "vps"
   ],
   "license": "MIT",
   "author": "Goncalo <goncalo@dealmeida.digital>",
@@ -20,17 +24,21 @@
     "url": "https://github.com/iamtheavoc1/opencode-claude-proxy/issues"
   },
   "homepage": "https://github.com/iamtheavoc1/opencode-claude-proxy#readme",
-  "type": "module",
-  "main": "./src/index.ts",
-  "exports": {
-    ".": "./src/index.ts"
-  },
   "files": [
-    "src",
+    "install.sh",
+    "scripts",
+    "systemd",
+    "launchd",
+    "legacy",
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "install:local": "bash install.sh",
+    "install:vps": "bash scripts/install-vps.sh",
+    "uninstall": "bash scripts/uninstall.sh"
+  },
   "engines": {
-    "bun": ">=1.0.0"
+    "node": ">=20"
   }
 }

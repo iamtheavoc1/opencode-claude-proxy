@@ -1,0 +1,12 @@
+[Unit]
+Description=Run meridian-keepalive every 12 hours so the OAuth refresh chain doesn't go stale
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=12h
+RandomizedDelaySec=10min
+Unit=meridian-keepalive.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

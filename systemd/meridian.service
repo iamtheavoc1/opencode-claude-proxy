@@ -1,0 +1,44 @@
+[Unit]
+Description=Meridian Anthropic proxy (opencode-claude-proxy)
+Documentation=https://github.com/iamtheavoc1/opencode-claude-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meridian
+Group=meridian
+WorkingDirectory=/var/lib/meridian
+Environment=HOME=/var/lib/meridian
+Environment=MERIDIAN_PASSTHROUGH=1
+Environment=MERIDIAN_PORT=3456
+Environment=MERIDIAN_HOST=127.0.0.1
+Environment=MERIDIAN_OPUS_MODEL=opus
+Environment=MERIDIAN_SONNET_MODEL=sonnet
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Resolve `meridian` via PATH; install-vps.sh templates the absolute path in.
+ExecStart=/usr/bin/env meridian
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/meridian/meridian.log
+StandardError=append:/var/log/meridian/meridian.log
+
+# ── Hardening ───────────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ReadWritePaths=/var/lib/meridian /var/log/meridian
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# Allow only the network family meridian needs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+# (Node JIT requires WX, leave as 'no'.)
+
+[Install]
+WantedBy=multi-user.target

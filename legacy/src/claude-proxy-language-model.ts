@@ -30,6 +30,7 @@ import {
   type ActiveProcess,
 } from "./session-manager.ts"
 import { EMPTY_USAGE, toV3Usage, type V3Usage } from "./usage.ts"
+import { emitTelemetry } from "./telemetry.ts"
 
 function generateId(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36)
@@ -445,6 +446,16 @@ export class ClaudeProxyLanguageModel {
               durationMs: msg.duration_ms ?? null,
             }
             if (msg.usage) latestUsage = msg.usage
+
+            emitTelemetry({
+              provider: self.config.name,
+              modelId: self.modelId,
+              sessionId: (resultMeta.sessionId as string | null) ?? null,
+              costUsd: (resultMeta.costUsd as number | null) ?? null,
+              durationMs: (resultMeta.durationMs as number | null) ?? null,
+              spawnedFresh: willSpawn,
+              usage: toV3Usage(latestUsage),
+            })
 
             if (msg.is_error) {
               const errText = msg.error_text ?? msg.error?.message ?? "Claude CLI reported an error"

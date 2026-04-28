@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Reference launchd plist for opencode-claude-proxy on macOS.
+
+    install.sh writes a templated copy of this file to
+        ~/Library/LaunchAgents/dev.meridian.proxy.plist
+    with the correct absolute paths for `node` and `meridian` resolved on
+    your machine. Use this file as a manual fallback if you want to
+    install autostart by hand.
+
+    Replace:
+        __NODE_BIN__       e.g. /opt/homebrew/bin/node
+        __MERIDIAN_BIN__   e.g. /opt/homebrew/bin/meridian
+        __HOME__           e.g. /Users/yourname
+        __PORT__           e.g. 3456
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.meridian.proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NODE_BIN__</string>
+        <string>__MERIDIAN_BIN__</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MERIDIAN_PASSTHROUGH</key> <string>1</string>
+        <key>MERIDIAN_PORT</key>        <string>__PORT__</string>
+        <key>MERIDIAN_OPUS_MODEL</key>  <string>opus</string>
+        <key>MERIDIAN_SONNET_MODEL</key><string>sonnet</string>
+        <key>PATH</key>                 <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>        <true/>
+    <key>KeepAlive</key>        <true/>
+    <key>ThrottleInterval</key> <integer>10</integer>
+    <key>WorkingDirectory</key> <string>__HOME__</string>
+    <key>StandardOutPath</key>  <string>__HOME__/.cache/meridian/meridian.log</string>
+    <key>StandardErrorPath</key><string>__HOME__/.cache/meridian/meridian.log</string>
+</dict>
+</plist>
